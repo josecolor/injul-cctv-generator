@@ -264,7 +264,7 @@ CATALOGO_CAMARAS = {
     ],
 }
 
-# --- HTML DE LA INTERFAZ WEB CON LISTADO DE CÁMARAS VISIBLE ---
+# --- HTML DE LA INTERFAZ WEB ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="es">
@@ -302,6 +302,9 @@ HTML_TEMPLATE = """
             if (activo) {
                 activo.style.display = 'block';
             }
+            // Asignar nombre real al input hidden
+            var selectedOption = select.options[select.selectedIndex];
+            document.getElementById('nombre-sucursal').value = selectedOption.text;
         }
         window.onload = function() {
             actualizarCamaras();
@@ -312,7 +315,6 @@ HTML_TEMPLATE = """
     <div class="container">
         <h1>INJUL - Sistema de Monitoreo CCTV</h1>
         
-        <!-- Formulario por Sucursal con sus Cámaras a la Vista -->
         <div class="card">
             <h3>Seleccionar Sucursal y Revisar Cámaras</h3>
             <div class="form-group">
@@ -343,32 +345,20 @@ HTML_TEMPLATE = """
                             <td>{{ loop.index }}</td>
                             <td style="text-align: left; font-weight: bold;">{{ cam }}</td>
                             <td>
-                                <select name="estado_{{ suc }}_{{ loop.index0 }}" style="padding: 4px;">
+                                <select name="estado_{{ loop.index0 }}" style="padding: 4px;">
                                     <option value="Operativa">Operativa (Sí)</option>
                                     <option value="No visible">No visible (Rojo)</option>
                                     <option value="Por verificar">Por verificar</option>
                                 </select>
                             </td>
                             <td>
-                                <input type="text" name="obs_{{ suc }}_{{ loop.index0 }}" placeholder="Detalle si falla..." style="padding: 4px;">
+                                <input type="text" name="obs_{{ loop.index0 }}" placeholder="Detalle si falla..." style="padding: 4px;">
                             </td>
                         </tr>
                         {% endfor %}
                     </table>
                 </div>
-                {% endfor %>
-
-                <script>
-                    // Actualizar el input hidden con el nombre real de la sucursal activa antes de enviar
-                    document.querySelector('form').onsubmit = function() {
-                        var select = document.getElementById('sucursal-select');
-                        var selectedOption = select.options[select.selectedIndex];
-                        // Guardamos el texto de la opción seleccionada
-                        // Pero para simplificar, podemos manejarlo directo en backend o asignar el valor aquí:
-                        // Crearemos un campo hidden cuyo valor sea el texto de la sucursal
-                        document.getElementById('nombre-sucursal').value = selectedOption.text;
-                    };
-                </script>
+                {% endfor %}
 
                 <div style="margin-top: 15px;">
                     <button type="submit" class="btn">💾 Guardar Estado de esta Sucursal</button>
@@ -376,7 +366,6 @@ HTML_TEMPLATE = """
             </form>
         </div>
 
-        <!-- Formulario de Tickets -->
         <div class="card">
             <h3>Registrar Ticket o Novedad con Proveedor</h3>
             <form action="/guardar-ticket" method="POST">
@@ -401,13 +390,12 @@ HTML_TEMPLATE = """
                 </div>
                 <div class="form-group">
                     <label>Detalle del Reporte (Información de lo que pasó):</label>
-                    <textarea name="detalle" rows="2" placeholder="Ej: Problemas de visualización o retraso en vivo..."></textarea>
+                    <textarea name="detalle" rows="2" placeholder="Ej: Problemas de visualización..."></textarea>
                 </div>
                 <button type="submit" class="btn btn-ticket">📝 Registrar Ticket</button>
             </form>
         </div>
 
-        <!-- Botones de Descarga -->
         <div class="card">
             <h3>Generación de Reportes Oficiales</h3>
             <a href="/descargar-pdf" class="btn">📥 Descargar PDF Oficial (13 Págs)</a>
@@ -512,8 +500,6 @@ def guardar_sucursal():
     try:
       conn = psycopg2.connect(database_url)
       cur = conn.cursor()
-
-      # Borrar registros previos de hoy para esta sucursal para actualizar limpia
       cur.execute(
           "DELETE FROM reportes_cctv_detalles WHERE fecha = %s AND sucursal = %s",
           (fecha_hoy, sucursal),
@@ -521,8 +507,8 @@ def guardar_sucursal():
 
       camaras = CATALOGO_CAMARAS[sucursal]
       for i, cam in enumerate(camaras):
-        estado = request.form.get(f"estado_{sucursal}_{i}") or "Operativa"
-        obs = request.form.get(f"obs_{sucursal}_{i}") or ""
+        estado = request.form.get(f"estado_{i}") or "Operativa"
+        obs = request.form.get(f"obs_{i}") or ""
         cur.execute(
             """
                     INSERT INTO reportes_cctv_detalles (fecha, sucursal, camara, estado, observacion)
@@ -547,226 +533,4 @@ def guardar_ticket():
   estado_ticket = request.form.get("estado_ticket")
   dias_abiertos = request.form.get("dias_abiertos") or 0
   detalle = request.form.get("detalle")
-  fecha_hoy = datetime.now().strftime("%Y-%m-%d")
-
-  database_url = os.environ.get("DATABASE_URL")
-  if database_url:
-    try:
-      conn = psycopg2.connect(database_url)
-      cur = conn.cursor()
-      cur.execute(
-          """
-                INSERT INTO reportes_tickets (fecha, ticket, sucursal_area, estado, dias_abiertos, detalle)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """,
-          (
-              fecha_hoy,
-              ticket,
-              sucursal_area,
-              estado_ticket,
-              int(dias_abiertos),
-              detalle,
-          ),
-      )
-      conn.commit()
-      cur.close()
-      conn.close()
-    except Exception as e:
-      print(f"Error guardando ticket: {e}")
-
-  return redirect(url_for("index"))
-
-
-@app.route("/descargar-pdf")
-def descargar_pdf():
-  pdf_path = "Reporte_CCTV_INJUL.pdf"
-  doc = SimpleDocTemplate(
-      pdf_path,
-      pagesize=letter,
-      leftMargin=36,
-      rightMargin=36,
-      topMargin=36,
-      bottomMargin=50,
-  )
-  story = []
-  from reportlab.lib.styles import ParagraphStyle
-
-  title_style = ParagraphStyle(
-      "TitleStyle",
-      fontName="Helvetica-Bold",
-      fontSize=15,
-      textColor=colors.HexColor("#1F497D"),
-  )
-  normal_style = ParagraphStyle(
-      "NormalStyle",
-      fontName="Helvetica",
-      fontSize=10,
-      textColor=colors.HexColor("#333333"),
-  )
-
-  # Cargar datos desde la base de datos
-  datos_detalles = {}
-  lista_tickets_db = []
-  database_url = os.environ.get("DATABASE_URL")
-  if database_url:
-    try:
-      conn = psycopg2.connect(database_url)
-      cur = conn.cursor()
-      cur.execute(
-          "SELECT sucursal, camara, estado, observacion FROM reportes_cctv_detalles"
-          " ORDER: id DESC;"
-      )  # or get latest
-      # Traer los de la última fecha registrada
-      cur.execute("""
-                SELECT sucursal, camara, estado, observacion 
-                FROM reportes_cctv_detalles 
-                WHERE fecha = (SELECT MAX(fecha) FROM reportes_cctv_detalles);
-            """)
-      for r in cur.fetchall():
-        suc, cam, est, obs = r[0], r[1], r[2], r[3]
-        if suc not in datos_detalles:
-          datos_detalles[suc] = {}
-        datos_detalles[suc][cam] = {"estado": est, "observacion": obs}
-
-      cur.execute("""
-                SELECT ticket, fecha, sucursal_area, estado, dias_abiertos, detalle
-                FROM reportes_tickets
-                ORDER BY id DESC;
-            """)
-      lista_tickets_db = cur.fetchall()
-      cur.close()
-      conn.close()
-    except Exception as e:
-      print(f"Error DB PDF: {e}")
-
-  # --- PÁGINA 1: PORTADA ---
-  logo_path = "logo.png"
-  if os.path.exists(logo_path):
-    logo_img = Image(logo_path, width=1.1 * inch, height=1.1 * inch)
-    header_text = Paragraph(
-        "<b>INJUL - Consolidado Maestro de CCTV</b><br/><font"
-        " size=9 color='#555555'>Investigadores Jurídicos EIRL<br/>Fecha:"
-        f" {datetime.now().strftime('%d/%m/%Y')} | Rango: 07:00 AM - 07:00"
-        " PM</font>",
-        title_style,
-    )
-    t_header = Table([[logo_img, header_text]], colWidths=[85, 455])
-    t_header.setStyle(
-        TableStyle([
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("ALIGN", (0, 0), (0, 0), "LEFT"),
-        ])
-    )
-    story.append(t_header)
-  else:
-    story.append(Paragraph("INJUL - Consolidado Maestro de CCTV", title_style))
-
-  story.append(Spacer(1, 15))
-
-  kpi_data = [
-      ["Cámaras Totales", "Operativas", "No Visibles", "Por Verificar", "Disponibilidad"],
-      ["223", "121", "97", "5", "54.3%"],
-  ]
-  t_kpi = Table(kpi_data, colWidths=[100, 100, 100, 100, 140])
-  t_kpi.setStyle(
-      TableStyle([
-          ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F497D")),
-          ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-          ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-          ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-          ("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#F2F2F2")),
-          ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
-      ])
-  )
-  story.append(t_kpi)
-  story.append(PageBreak())
-
-  # --- PÁGINA 2: HALLAZGOS ---
-  story.append(Paragraph("<b>Hallazgos del Día y Resumen de Tickets</b>", title_style))
-  story.append(Spacer(1, 10))
-  story.append(
-      Paragraph(
-          "1. Monitoreo activo de la red de sucursales en EZStation.<br/>2."
-          " Seguimiento de incidencias técnicas detalladas por cámara.",
-          normal_style,
-      )
-  )
-  story.append(PageBreak())
-
-  # --- SUCURSALES Y SUS CÁMARAS EN EL PDF ---
-  for idx, (suc, camaras) in enumerate(CATALOGO_CAMARAS.items(), start=1):
-    story.append(Paragraph(f"<b>Sucursal {idx} de 9: {suc}</b>", title_style))
-    story.append(Spacer(1, 10))
-
-    branch_rows = [
-        ["#", "Ubicación / Nombre en EZStation", "En vivo", "Grabación", "Estado", "Observaciones"]
-    ]
-    suc_data = datos_detalles.get(suc, {})
-
-    for c_idx, cam_nombre in enumerate(camaras, start=1):
-      info_cam = suc_data.get(cam_nombre, {"estado": "Operativa", "observacion": ""})
-      estado_txt = info_cam["estado"]
-      obs_txt = info_cam["observacion"]
-      branch_rows.append(
-          [str(c_idx), cam_nombre, "Sí", "Normal", estado_txt, obs_txt]
-      )
-
-    t_branch = Table(branch_rows, colWidths=[25, 185, 50, 70, 70, 140])
-    t_branch.setStyle(
-        TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#333333")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#DDDDDD")),
-            ("FONTSIZE", (0, 0), (-1, -1), 8),
-        ])
-    )
-    story.append(t_branch)
-    story.append(PageBreak())
-
-  # --- PÁGINA FINAL: TICKETS ---
-  story.append(Paragraph("<b>Seguimiento de Tickets con el Proveedor</b>", title_style))
-  story.append(Spacer(1, 10))
-
-  tickets_tabla_data = [["Ticket", "Fecha", "Sucursal / Área", "Estado", "Días", "Detalle"]]
-  if lista_tickets_db:
-    for t in lista_tickets_db:
-      tickets_tabla_data.append([str(t[0]), str(t[1]), str(t[2]), str(t[3]), str(t[4]), str(t[5])])
-  else:
-    tickets_tabla_data.append(["N/A", "N/A", "Sin tickets registrados", "N/A", "0", "N/A"])
-
-  t_tickets = Table(tickets_tabla_data, colWidths=[60, 75, 120, 80, 45, 150])
-  t_tickets.setStyle(
-      TableStyle([
-          ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F497D")),
-          ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-          ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-          ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-          ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
-          ("FONTSIZE", (0, 0), (-1, -1), 8),
-      ])
-  )
-  story.append(t_tickets)
-  story.append(PageBreak())
-
-  doc.build(story, canvasmaker=NumberedCanvas)
-  return send_file(pdf_path, as_attachment=True)
-
-
-@app.route("/descargar-excel")
-def descargar_excel():
-  excel_path = "Reporte_CCTV_INJUL.xlsx"
-  wb = openpyxl.Workbook()
-  ws = wb.active
-  ws.title = "Resumen"
-  ws["A1"] = "INJUL - Consolidado de CCTV"
-  ws["A1"].font = Font(name="Helvetica", size=14, bold=True, color="1F497D")
-  wb.save(excel_path)
-  return send_file(excel_path, as_attachment=True)
-
-
-if __name__ == "__main__":
-  inicializar_base_de_datos()
-  port = int(os.environ.get("PORT", 8080))
-  app.run(host="0.0.0.0", port=port)
+  fecha_hoy = datetime.now().
