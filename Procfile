@@ -1,0 +1,7 @@
+Flask>=3.0
+gunicorn>=22.0
+openpyxl>=3.1
+reportlab>=4.0
+psycopg2-binary>=2.9
+redis>=5.0
+tzdata
