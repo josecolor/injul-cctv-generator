@@ -261,6 +261,7 @@ HTML_TEMPLATE = """
 <body>
     <div class="container">
         <h1>INJUL - Sistema de Monitoreo CCTV</h1>
+        <p style="margin: 0 0 12px;"><a class="btn btn-gris" href="/ciclico/">Plan de Monitoreo Cíclico y Novedades →</a></p>
 
         {% if mensaje %}<div class="aviso {{ tipo }}">{{ mensaje }}</div>{% endif %}
 
@@ -1228,6 +1229,20 @@ def descargar_excel():
         download_name="Reporte_CCTV_INJUL.xlsx",
     )
 
+
+# --- Módulo independiente: Plan de Monitoreo Cíclico y Novedades (/ciclico) ---
+# Tiene sus propias tablas (ciclico_*) y rutas; sólo lee CATALOGO_CAMARAS.
+import ciclico  # noqa: E402
+
+ciclico.registrar(
+    app,
+    catalogo=CATALOGO_CAMARAS,
+    db_cursor=db_cursor,
+    ahora=ahora,
+    local_txt=local_txt,
+    ip_cliente=ip_cliente,
+    database_url=DATABASE_URL,
+)
 
 # Se ejecuta al importar, para que funcione tanto con gunicorn como con python main.py
 inicializar_base_de_datos()
