@@ -6,8 +6,10 @@ import psycopg2
 from flask import Flask, redirect, render_template_string, request, send_file, url_for
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
+from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
 from reportlab.platypus import (
+    Image,
     PageBreak,
     Paragraph,
     SimpleDocTemplate,
@@ -18,7 +20,7 @@ from reportlab.platypus import (
 
 app = Flask(__name__)
 
-# --- HTML DE LA INTERFAZ WEB CON FORMULARIO Y REGISTROS ---
+# --- HTML DE LA INTERFAZ WEB (PANEL DE CONTROL CON FORMULARIO) ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="es">
@@ -84,7 +86,7 @@ HTML_TEMPLATE = """
         <!-- Botones de Descarga -->
         <div class="card">
             <h3>Generación de Reportes Oficiales</h3>
-            <a href="/descargar-pdf" class="btn">📥 Descargar PDF (13 Págs)</a>
+            <a href="/descargar-pdf" class="btn">📥 Descargar PDF Oficial (INJUL)</a>
             <a href="/descargar-excel" class="btn btn-excel">📊 Descargar Excel Matriz</a>
         </div>
 
@@ -118,6 +120,52 @@ HTML_TEMPLATE = """
 </body>
 </html>
 """
+
+
+# --- CLASE PARA MARCA DE AGUA CONFIDENCIAL Y PIE DE PÁGINA ---
+class NumberedCanvas(canvas.Canvas):
+
+  def __init__(self, *args, **kwargs):
+    super().__init__(*args, **kwargs)
+    self._saved_page_states = []
+
+  def showPage(self):
+    self._saved_page_states.append(dict(self.__dict__))
+    self._startPage()
+
+  def save(self):
+    num_pages = len(self._saved_page_states)
+    for state in self._saved_page_states:
+      self.__dict__.update(state)
+      self.draw_watermark_and_footer(num_pages)
+      super().showPage()
+    super().save()
+
+  def draw_watermark_and_footer(self, total_pages):
+    # Marca de agua CONFIDENCIAL
+    self.saveState()
+    self.setFont("Helvetica-Bold", 60)
+    self.setFillColor(colors.HexColor("#F2DEDE"), alpha=0.3)
+    self.translate(300, 400)
+    self.rotate(45)
+    self.drawCentredString(0, 0, "CONFIDENCIAL")
+    self.restoreState()
+
+    # Pie de pagina oficial
+    self.saveState()
+    self.setFont("Helvetica", 9)
+    self.setFillColor(colors.HexColor("#555555"))
+    self.drawString(
+        36,
+        25,
+        "INJUL Consolidado Maestro de CCTV                         Documento"
+        " confidencial",
+    )
+    self.drawRightString(letter[0] - 36, 25, f"Página {self._pageNumber} de {total_pages}")
+    self.setStrokeColor(colors.HexColor("#CCCCCC"))
+    self.setLineWidth(0.5)
+    self.line(36, 38, letter[0] - 36, 38)
+    self.restoreState()
 
 
 def inicializar_base_de_datos():
@@ -218,7 +266,7 @@ def descargar_pdf():
   title_style = ParagraphStyle(
       "TitleStyle",
       fontName="Helvetica-Bold",
-      fontSize=16,
+      fontSize=15,
       textColor=colors.HexColor("#1F497D"),
   )
   normal_style = ParagraphStyle(
@@ -228,18 +276,31 @@ def descargar_pdf():
       textColor=colors.HexColor("#333333"),
   )
 
-  story.append(Paragraph("INJUL - Consolidado Maestro de CCTV", title_style))
-  story.append(Spacer(1, 10))
-  story.append(
-      Paragraph(
-          "<b>Fecha del Reporte:</b> "
-          + datetime.now().strftime("%d/%m/%Y")
-          + " | <b>Rango:</b> 07:00 AM - 07:00 PM",
-          normal_style,
-      )
-  )
+  # --- CABECERA CON EL LOGO INJUL ---
+  logo_path = "logo.png"
+  if os.path.exists(logo_path):
+    logo_img = Image(logo_path, width=1.1 * inch, height=1.1 * inch)
+    header_text = Paragraph(
+        "<b>INJUL - Consolidado Maestro de CCTV</b><br/><font"
+        " size=9 color='#555555'>Investigadores Jurídicos EIRL<br/>Fecha:"
+        f" {datetime.now().strftime('%d/%m/%Y')} | Rango: 07:00 AM - 07:00"
+        " PM</font>",
+        title_style,
+    )
+    t_header = Table([[logo_img, header_text]], colWidths=[85, 455])
+    t_header.setStyle(
+        TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("ALIGN", (0, 0), (0, 0), "LEFT"),
+        ])
+    )
+    story.append(t_header)
+  else:
+    story.append(Paragraph("INJUL - Consolidado Maestro de CCTV", title_style))
+
   story.append(Spacer(1, 15))
 
+  # RESUMEN DE KPIS
   kpi_data = [
       ["Cámaras Totales", "Operativas", "No Visibles", "Por Verificar", "Disponibilidad"],
       ["223", "121", "97", "5", "54.3%"],
@@ -258,7 +319,41 @@ def descargar_pdf():
   story.append(t_kpi)
   story.append(PageBreak())
 
-  doc.build(story)
+  # HOJAS DE DETALLE POR SUCURSAL
+  sucursales = [
+      "Caribbean Agregados",
+      "Marmotech Blue Mall",
+      "Marmotech DCM",
+      "Marmotech Outlet RP",
+      "Marmotech Punta Cana",
+      "Sucursal San Cristóbal",
+      "Marmotech Santiago 1",
+      "Marmotech Santiago 2",
+      "Santiago 2 - Sección Muebles",
+  ]
+  for idx, suc in enumerate(sucursales, start=1):
+    story.append(Paragraph(f"<b>Sucursal {idx} de 9: {suc}</b>", title_style))
+    story.append(Spacer(1, 10))
+    branch_data = [
+        ["#", "Ubicación / Nombre en EZStation", "En vivo", "Grabación", "Estado", "Observaciones"],
+        ["1", "Entrada Principal", "Sí", "Normal", "Operativa", ""],
+        ["2", "Pasillo Lateral", "Sí", "Normal", "No visible", "Revisar cableado"],
+    ]
+    t_branch = Table(branch_data, colWidths=[30, 180, 60, 80, 80, 110])
+    t_branch.setStyle(
+        TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#333333")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#DDDDDD")),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ])
+    )
+    story.append(t_branch)
+    story.append(PageBreak())
+
+  doc.build(story, canvasmaker=NumberedCanvas)
   return send_file(pdf_path, as_attachment=True)
 
 
