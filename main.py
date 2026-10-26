@@ -1,5 +1,6 @@
 import os
 from datetime import datetime
+import keep_alive
 import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
 import psycopg2
@@ -19,6 +20,7 @@ from reportlab.platypus import (
 )
 
 app = Flask(__name__)
+keep_alive.iniciar_anti_sleep()
 
 # --- CATÁLOGO OFICIAL DE CÁMARAS POR SUCURSAL ---
 CATALOGO_CAMARAS = {
@@ -721,7 +723,7 @@ def descargar_pdf():
           ("ALIGN", (0, 0), (-1, -1), "CENTER"),
           ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
           ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
-          ("FONTSIZE", (0, 0),(-1, -1), 8),
+          ("FONTSIZE", (0, 0), (-1, -1), 8),
       ])
   )
   story.append(t_tickets)
