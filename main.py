@@ -197,7 +197,6 @@ CATALOGO_CAMARAS = {
         "Garita Guardian",
         "Escritorio Garit",
         "Frente Puerta no",
-        "Almacen Repuesto",
         "Almacen Repuesto (2)",
         "Ing y Calidad",
         "Alm Gene 07",
@@ -265,7 +264,7 @@ CATALOGO_CAMARAS = {
     ],
 }
 
-# --- HTML DE LA INTERFAZ WEB ---
+# --- HTML DE LA INTERFAZ WEB CON LISTADO DE CÁMARAS VISIBLE ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="es">
@@ -286,42 +285,98 @@ HTML_TEMPLATE = """
         .form-group { margin-bottom: 10px; }
         label { display: block; font-weight: bold; font-size: 13px; margin-bottom: 3px; color: #444; }
         input, select, textarea { width: 100%; padding: 8px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
-        table { width: 100%; border-collapse: collapse; margin-top: 15px; overflow-x: auto; display: block; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
         th, td { border: 1px solid #ddd; padding: 8px; text-align: center; font-size: 12px; }
         th { background-color: #1F497D; color: white; }
+        .camera-row { background: #fff; }
     </style>
+    <script>
+        function actualizarCamaras() {
+            var select = document.getElementById('sucursal-select');
+            var sucursalSeleccionada = select.value;
+            var divs = document.getElementsByClassName('lista-sucursal');
+            for (var i = 0; i < divs.length; i++) {
+                divs[i].style.display = 'none';
+            }
+            var activo = document.getElementById('sucursal-' + sucursalSeleccionada);
+            if (activo) {
+                activo.style.display = 'block';
+            }
+        }
+        window.onload = function() {
+            actualizarCamaras();
+        }
+    </script>
 </head>
 <body>
     <div class="container">
         <h1>INJUL - Sistema de Monitoreo CCTV</h1>
         
+        <!-- Formulario por Sucursal con sus Cámaras a la Vista -->
         <div class="card">
-            <h3>Registrar Estado Global de Sucursal</h3>
-            <form action="/guardar" method="POST">
-                <div class="form-group">
-                    <label>Sucursal:</label>
-                    <select name="sucursal" required>
-                        {% for suc in sucursales %}
-                        <option value="{{ suc }}">{{ suc }}</option>
+            <h3>Seleccionar Sucursal y Revisar Cámaras</h3>
+            <div class="form-group">
+                <label>Sucursal:</label>
+                <select id="sucursal-select" onchange="actualizarCamaras()">
+                    {% for suc in catalogo.keys() %}
+                    <option value="{{ loop.index0 }}">{{ suc }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+
+            <form action="/guardar-sucursal" method="POST">
+                <input type="hidden" id="nombre-sucursal" name="sucursal" value="">
+                
+                {% for suc, camaras in catalogo.items() %}
+                <div id="sucursal-{{ loop.index0 }}" class="lista-sucursal" style="display:none; margin-top: 15px;">
+                    <h4 style="color: #1F497D; margin-bottom: 5px;">Cámaras de {{ suc }}</h4>
+                    <p style="font-size: 12px; color: #666;">Selecciona el estado de cada cámara para el reporte:</p>
+                    <table>
+                        <tr>
+                            <th>#</th>
+                            <th>Nombre de la Cámara (EZStation)</th>
+                            <th>Estado</th>
+                            <th>Observación</th>
+                        </tr>
+                        {% for cam in camaras %}
+                        <tr class="camera-row">
+                            <td>{{ loop.index }}</td>
+                            <td style="text-align: left; font-weight: bold;">{{ cam }}</td>
+                            <td>
+                                <select name="estado_{{ suc }}_{{ loop.index0 }}" style="padding: 4px;">
+                                    <option value="Operativa">Operativa (Sí)</option>
+                                    <option value="No visible">No visible (Rojo)</option>
+                                    <option value="Por verificar">Por verificar</option>
+                                </select>
+                            </td>
+                            <td>
+                                <input type="text" name="obs_{{ suc }}_{{ loop.index0 }}" placeholder="Detalle si falla..." style="padding: 4px;">
+                            </td>
+                        </tr>
                         {% endfor %}
-                    </select>
+                    </table>
                 </div>
-                <div class="form-group">
-                    <label>Cámaras Operativas:</label>
-                    <input type="number" name="operativas" required placeholder="Ej: 15">
+                {% endfor %>
+
+                <script>
+                    // Actualizar el input hidden con el nombre real de la sucursal activa antes de enviar
+                    document.querySelector('form').onsubmit = function() {
+                        var select = document.getElementById('sucursal-select');
+                        var selectedOption = select.options[select.selectedIndex];
+                        // Guardamos el texto de la opción seleccionada
+                        // Pero para simplificar, podemos manejarlo directo en backend o asignar el valor aquí:
+                        // Crearemos un campo hidden cuyo valor sea el texto de la sucursal
+                        document.getElementById('nombre-sucursal').value = selectedOption.text;
+                    };
+                </script>
+
+                <div style="margin-top: 15px;">
+                    <button type="submit" class="btn">💾 Guardar Estado de esta Sucursal</button>
                 </div>
-                <div class="form-group">
-                    <label>Cámaras No Visibles / Sin Grabación:</label>
-                    <input type="number" name="no_visibles" required placeholder="Ej: 2">
-                </div>
-                <div class="form-group">
-                    <label>Observaciones / Novedades:</label>
-                    <textarea name="observaciones" rows="2" placeholder="Detalles generales..."></textarea>
-                </div>
-                <button type="submit" class="btn">💾 Guardar Resumen Sucursal</button>
             </form>
         </div>
 
+        <!-- Formulario de Tickets -->
         <div class="card">
             <h3>Registrar Ticket o Novedad con Proveedor</h3>
             <form action="/guardar-ticket" method="POST">
@@ -352,6 +407,7 @@ HTML_TEMPLATE = """
             </form>
         </div>
 
+        <!-- Botones de Descarga -->
         <div class="card">
             <h3>Generación de Reportes Oficiales</h3>
             <a href="/descargar-pdf" class="btn">📥 Descargar PDF Oficial (13 Págs)</a>
@@ -415,14 +471,13 @@ def inicializar_base_de_datos():
     conn = psycopg2.connect(database_url)
     cur = conn.cursor()
     cur.execute("""
-            CREATE TABLE IF NOT EXISTS reportes_cctv (
+            CREATE TABLE IF NOT EXISTS reportes_cctv_detalles (
                 id SERIAL PRIMARY KEY,
                 fecha DATE NOT NULL,
                 sucursal VARCHAR(100) NOT NULL,
-                operativas INT,
-                no_visibles INT,
-                observaciones TEXT,
-                creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                camara VARCHAR(150) NOT NULL,
+                estado VARCHAR(50) NOT NULL,
+                observacion TEXT
             );
             CREATE TABLE IF NOT EXISTS reportes_tickets (
                 id SERIAL PRIMARY KEY,
@@ -444,42 +499,43 @@ def inicializar_base_de_datos():
 
 @app.route("/")
 def index():
-  return render_template_string(
-      HTML_TEMPLATE, sucursales=list(CATALOGO_CAMARAS.keys())
-  )
+  return render_template_string(HTML_TEMPLATE, catalogo=CATALOGO_CAMARAS)
 
 
-@app.route("/guardar", methods=["POST"])
-def guardar():
+@app.route("/guardar-sucursal", methods=["POST"])
+def guardar_sucursal():
   sucursal = request.form.get("sucursal")
-  operativas = request.form.get("operativas")
-  no_visibles = request.form.get("no_visibles")
-  observaciones = request.form.get("observaciones")
   fecha_hoy = datetime.now().strftime("%Y-%m-%d")
 
   database_url = os.environ.get("DATABASE_URL")
-  if database_url:
+  if database_url and sucursal in CATALOGO_CAMARAS:
     try:
       conn = psycopg2.connect(database_url)
       cur = conn.cursor()
+
+      # Borrar registros previos de hoy para esta sucursal para actualizar limpia
       cur.execute(
-          """
-                INSERT INTO reportes_cctv (fecha, sucursal, operativas, no_visibles, observaciones)
-                VALUES (%s, %s, %s, %s, %s)
-            """,
-          (
-              fecha_hoy,
-              sucursal,
-              int(operativas),
-              int(no_visibles),
-              observaciones,
-          ),
+          "DELETE FROM reportes_cctv_detalles WHERE fecha = %s AND sucursal = %s",
+          (fecha_hoy, sucursal),
       )
+
+      camaras = CATALOGO_CAMARAS[sucursal]
+      for i, cam in enumerate(camaras):
+        estado = request.form.get(f"estado_{sucursal}_{i}") or "Operativa"
+        obs = request.form.get(f"obs_{sucursal}_{i}") or ""
+        cur.execute(
+            """
+                    INSERT INTO reportes_cctv_detalles (fecha, sucursal, camara, estado, observacion)
+                    VALUES (%s, %s, %s, %s, %s)
+                """,
+            (fecha_hoy, sucursal, cam, estado, obs),
+        )
+
       conn.commit()
       cur.close()
       conn.close()
     except Exception as e:
-      print(f"Error guardando en DB: {e}")
+      print(f"Error guardando sucursal: {e}")
 
   return redirect(url_for("index"))
 
@@ -548,25 +604,29 @@ def descargar_pdf():
       textColor=colors.HexColor("#333333"),
   )
 
-  # Consultar datos de la DB
-  datos_sucursales = {}
+  # Cargar datos desde la base de datos
+  datos_detalles = {}
   lista_tickets_db = []
   database_url = os.environ.get("DATABASE_URL")
   if database_url:
     try:
       conn = psycopg2.connect(database_url)
       cur = conn.cursor()
+      cur.execute(
+          "SELECT sucursal, camara, estado, observacion FROM reportes_cctv_detalles"
+          " ORDER: id DESC;"
+      )  # or get latest
+      # Traer los de la última fecha registrada
       cur.execute("""
-                SELECT DISTINCT ON (sucursal) sucursal, operativas, no_visibles, observaciones, fecha
-                FROM reportes_cctv
-                ORDER BY sucursal, id DESC;
+                SELECT sucursal, camara, estado, observacion 
+                FROM reportes_cctv_detalles 
+                WHERE fecha = (SELECT MAX(fecha) FROM reportes_cctv_detalles);
             """)
       for r in cur.fetchall():
-        datos_sucursales[r[0]] = {
-            "operativas": r[1],
-            "no_visibles": r[2],
-            "observaciones": r[3] or "",
-        }
+        suc, cam, est, obs = r[0], r[1], r[2], r[3]
+        if suc not in datos_detalles:
+          datos_detalles[suc] = {}
+        datos_detalles[suc][cam] = {"estado": est, "observacion": obs}
 
       cur.execute("""
                 SELECT ticket, fecha, sucursal_area, estado, dias_abiertos, detalle
@@ -627,35 +687,29 @@ def descargar_pdf():
   story.append(
       Paragraph(
           "1. Monitoreo activo de la red de sucursales en EZStation.<br/>2."
-          " Seguimiento de incidencias técnicas con el proveedor.",
+          " Seguimiento de incidencias técnicas detalladas por cámara.",
           normal_style,
       )
   )
   story.append(PageBreak())
 
-  # --- SUCURSALES (CON SUS CÁMARAS OFICIALES PRE-CARGADAS) ---
+  # --- SUCURSALES Y SUS CÁMARAS EN EL PDF ---
   for idx, (suc, camaras) in enumerate(CATALOGO_CAMARAS.items(), start=1):
-    info = datos_sucursales.get(
-        suc, {"operativas": 0, "no_visibles": 0, "observaciones": "Sin novedades"}
-    )
     story.append(Paragraph(f"<b>Sucursal {idx} de 9: {suc}</b>", title_style))
     story.append(Spacer(1, 10))
-    story.append(
-        Paragraph(
-            f"<b>Operativas:</b> {info['operativas']} | <b>No Visibles:</b>"
-            f" {info['no_visibles']}<br/><b>Observaciones:</b>"
-            f" {info['observaciones']}",
-            normal_style,
-        )
-    )
-    story.append(Spacer(1, 10))
 
-    # Construir tabla con todas las cámaras oficiales de la sucursal
     branch_rows = [
         ["#", "Ubicación / Nombre en EZStation", "En vivo", "Grabación", "Estado", "Observaciones"]
     ]
+    suc_data = datos_detalles.get(suc, {})
+
     for c_idx, cam_nombre in enumerate(camaras, start=1):
-      branch_rows.append([str(c_idx), cam_nombre, "Sí", "Normal", "Operativa", ""])
+      info_cam = suc_data.get(cam_nombre, {"estado": "Operativa", "observacion": ""})
+      estado_txt = info_cam["estado"]
+      obs_txt = info_cam["observacion"]
+      branch_rows.append(
+          [str(c_idx), cam_nombre, "Sí", "Normal", estado_txt, obs_txt]
+      )
 
     t_branch = Table(branch_rows, colWidths=[25, 185, 50, 70, 70, 140])
     t_branch.setStyle(
