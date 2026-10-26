@@ -3,7 +3,7 @@ from datetime import datetime
 import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
 import psycopg2
-from flask import Flask, render_template_string, request, send_file
+from flask import Flask, redirect, render_template_string, request, send_file, url_for
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
@@ -18,7 +18,7 @@ from reportlab.platypus import (
 
 app = Flask(__name__)
 
-# --- HTML DE LA INTERFAZ WEB (PANEL DE CONTROL) ---
+# --- HTML DE LA INTERFAZ WEB CON FORMULARIO Y REGISTROS ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="es">
@@ -27,80 +27,97 @@ HTML_TEMPLATE = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>INJUL - Consolidado CCTV</title>
     <style>
-        body { font-family: Arial, sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 20px; }
-        .container { max-width: 800px; margin: 0 auto; background: #fff; padding: 25px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
-        h1 { color: #1F497D; font-size: 22px; border-bottom: 2px solid #1F497D; padding-bottom: 10px; }
+        body { font-family: Arial, sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 15px; }
+        .container { max-width: 900px; margin: 0 auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+        h1 { color: #1F497D; font-size: 20px; border-bottom: 2px solid #1F497D; padding-bottom: 8px; }
+        h3 { color: #1F497D; margin-top: 5px; }
         .card { background: #f8f9fa; padding: 15px; margin-bottom: 15px; border-radius: 6px; border-left: 4px solid #1F497D; }
-        .btn { display: inline-block; background: #1F497D; color: white; padding: 10px 18px; text-decoration: none; border-radius: 4px; font-weight: bold; margin-top: 10px; margin-right: 10px; border: none; cursor: pointer; }
+        .btn { display: inline-block; background: #1F497D; color: white; padding: 10px 15px; text-decoration: none; border-radius: 4px; font-weight: bold; margin-top: 5px; margin-right: 5px; border: none; cursor: pointer; font-size: 14px; }
         .btn-excel { background: #217346; }
         .btn:hover { opacity: 0.9; }
-        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
-        th, td { border: 1px solid #ddd; padding: 8px; text-align: center; font-size: 13px; }
+        .form-group { margin-bottom: 10px; }
+        label { display: block; font-weight: bold; font-size: 13px; margin-bottom: 3px; color: #444; }
+        input, select, textarea { width: 100%; padding: 8px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; overflow-x: auto; display: block; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: center; font-size: 12px; }
         th { background-color: #1F497D; color: white; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>INJUL - Sistema de Reportes CCTV</h1>
+        <h1>INJUL - Sistema de Monitoreo CCTV</h1>
         
+        <!-- Formulario para ingresar datos -->
         <div class="card">
-            <h3>Generación de Salida Doble</h3>
-            <p>Haz clic para descargar de inmediato los reportes oficiales actualizados al día de hoy.</p>
+            <h3>Registrar Estado de Sucursal</h3>
+            <form action="/guardar" method="POST">
+                <div class="form-group">
+                    <label>Sucursal:</label>
+                    <select name="sucursal" required>
+                        <option value="Caribbean Agregados">Caribbean Agregados</option>
+                        <option value="Marmotech Blue Mall">Marmotech Blue Mall</option>
+                        <option value="Marmotech DCM">Marmotech DCM</option>
+                        <option value="Marmotech Outlet RP">Marmotech Outlet RP</option>
+                        <option value="Marmotech Punta Cana">Marmotech Punta Cana</option>
+                        <option value="Sucursal San Cristóbal">Sucursal San Cristóbal</option>
+                        <option value="Marmotech Santiago 1">Marmotech Santiago 1</option>
+                        <option value="Marmotech Santiago 2">Marmotech Santiago 2</option>
+                        <option value="Santiago 2 - Sección Muebles">Santiago 2 - Sección Muebles</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Cámaras Operativas:</label>
+                    <input type="number" name="operativas" required placeholder="Ej: 15">
+                </div>
+                <div class="form-group">
+                    <label>Cámaras No Visibles / Sin Grabación:</label>
+                    <input type="number" name="no_visibles" required placeholder="Ej: 2">
+                </div>
+                <div class="form-group">
+                    <label>Observaciones / Novedades:</label>
+                    <textarea name="observaciones" rows="2" placeholder="Detalles de cámaras o cableado..."></textarea>
+                </div>
+                <button type="submit" class="btn">💾 Guardar en Base de Datos</button>
+            </form>
+        </div>
+
+        <!-- Botones de Descarga -->
+        <div class="card">
+            <h3>Generación de Reportes Oficiales</h3>
             <a href="/descargar-pdf" class="btn">📥 Descargar PDF (13 Págs)</a>
             <a href="/descargar-excel" class="btn btn-excel">📊 Descargar Excel Matriz</a>
         </div>
 
+        <!-- Historial Registrado -->
         <div class="card">
-            <h3>Estado del Sistema y Base de datos</h3>
-            <p>🟢 Conectado a PostgreSQL (Railway) | 🏢 Monitoreo de 9 Sucursales Activo.</p>
+            <h3>Historial Reciente en PostgreSQL</h3>
+            <table>
+                <tr>
+                    <th>Fecha</th>
+                    <th>Sucursal</th>
+                    <th>Operativas</th>
+                    <th>No Visibles</th>
+                    <th>Observaciones</th>
+                </tr>
+                {% for row in registros %}
+                <tr>
+                    <td>{{ row[1] }}</td>
+                    <td>{{ row[2] }}</td>
+                    <td>{{ row[3] }}</td>
+                    <td>{{ row[4] }}</td>
+                    <td>{{ row[5] }}</td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="5">No hay registros guardados todavía.</td>
+                </tr>
+                {% endfor %}
+            </table>
         </div>
     </div>
 </body>
 </html>
 """
-
-
-class NumberedCanvas(canvas.Canvas):
-
-  def __init__(self, *args, **kwargs):
-    super().__init__(*args, **kwargs)
-    self._saved_page_states = []
-
-  def showPage(self):
-    self._saved_page_states.append(dict(self.__dict__))
-    self._startPage()
-
-  def save(self):
-    num_pages = len(self._saved_page_states)
-    for state in self._saved_page_states:
-      self.__dict__.update(state)
-      self.draw_watermark_and_footer(num_pages)
-      super().showPage()
-    super().save()
-
-  def draw_watermark_and_footer(self, total_pages):
-    self.saveState()
-    self.setFont("Helvetica-Bold", 60)
-    self.setFillColor(colors.HexColor("#F2DEDE"), alpha=0.4)
-    self.translate(300, 400)
-    self.rotate(45)
-    self.drawCentredString(0, 0, "CONFIDENCIAL")
-    self.restoreState()
-
-    self.saveState()
-    self.setFont("Helvetica", 9)
-    self.setFillColor(colors.HexColor("#555555"))
-    self.drawString(
-        36,
-        25,
-        "INJUL Consolidado Maestro de CCTV                         Documento"
-        " confidencial",
-    )
-    self.drawRightString(letter[0] - 36, 25, f"Página {self._pageNumber} de {total_pages}")
-    self.setStrokeColor(colors.HexColor("#CCCCCC"))
-    self.setLineWidth(0.5)
-    self.line(36, 38, letter[0] - 36, 38)
-    self.restoreState()
 
 
 def inicializar_base_de_datos():
@@ -114,11 +131,10 @@ def inicializar_base_de_datos():
             CREATE TABLE IF NOT EXISTS reportes_cctv (
                 id SERIAL PRIMARY KEY,
                 fecha DATE NOT NULL,
-                total_camaras INT,
+                sucursal VARCHAR(100) NOT NULL,
                 operativas INT,
                 no_visibles INT,
-                por_verificar INT,
-                disponibilidad VARCHAR(20),
+                observaciones TEXT,
                 creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
@@ -131,7 +147,58 @@ def inicializar_base_de_datos():
 
 @app.route("/")
 def index():
-  return render_template_string(HTML_TEMPLATE)
+  registros = []
+  database_url = os.environ.get("DATABASE_URL")
+  if database_url:
+    try:
+      conn = psycopg2.connect(database_url)
+      cur = conn.cursor()
+      cur.execute(
+          "SELECT id, fecha, sucursal, operativas, no_visibles, observaciones"
+          " FROM reportes_cctv ORDER BY id DESC LIMIT 15;"
+      )
+      registros = cur.fetchall()
+      cur.close()
+      conn.close()
+    except Exception as e:
+      print(f"Error leyendo DB: {e}")
+
+  return render_template_string(HTML_TEMPLATE, registros=registros)
+
+
+@app.route("/guardar", methods=["POST"])
+def guardar():
+  sucursal = request.form.get("sucursal")
+  operativas = request.form.get("operativas")
+  no_visibles = request.form.get("no_visibles")
+  observaciones = request.form.get("observaciones")
+  fecha_hoy = datetime.now().strftime("%Y-%m-%d")
+
+  database_url = os.environ.get("DATABASE_URL")
+  if database_url:
+    try:
+      conn = psycopg2.connect(database_url)
+      cur = conn.cursor()
+      cur.execute(
+          """
+                INSERT INTO reportes_cctv (fecha, sucursal, operativas, no_visibles, observaciones)
+                VALUES (%s, %s, %s, %s, %s)
+            """,
+          (
+              fecha_hoy,
+              sucursal,
+              int(operativas),
+              int(no_visibles),
+              observaciones,
+          ),
+      )
+      conn.commit()
+      cur.close()
+      conn.close()
+    except Exception as e:
+      print(f"Error guardando en DB: {e}")
+
+  return redirect(url_for("index"))
 
 
 @app.route("/descargar-pdf")
@@ -191,40 +258,7 @@ def descargar_pdf():
   story.append(t_kpi)
   story.append(PageBreak())
 
-  sucursales = [
-      "Caribbean Agregados",
-      "Marmotech Blue Mall",
-      "Marmotech DCM",
-      "Marmotech Outlet RP",
-      "Marmotech Punta Cana",
-      "Sucursal San Cristóbal",
-      "Marmotech Santiago 1",
-      "Marmotech Santiago 2",
-      "Santiago 2 - Sección Muebles",
-  ]
-  for idx, suc in enumerate(sucursales, start=1):
-    story.append(Paragraph(f"<b>Sucursal {idx} de 9: {suc}</b>", title_style))
-    story.append(Spacer(1, 10))
-    branch_data = [
-        ["#", "Ubicación / Nombre en EZStation", "En vivo", "Grabación", "Estado", "Observaciones"],
-        ["1", "Entrada Principal", "Sí", "Normal", "Operativa", ""],
-        ["2", "Pasillo Lateral", "Sí", "Normal", "No visible", "Revisar cableado"],
-    ]
-    t_branch = Table(branch_data, colWidths=[30, 180, 60, 80, 80, 110])
-    t_branch.setStyle(
-        TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#333333")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#DDDDDD")),
-            ("FONTSIZE", (0, 0), (-1, -1), 9),
-        ])
-    )
-    story.append(t_branch)
-    story.append(PageBreak())
-
-  doc.build(story, canvasmaker=NumberedCanvas)
+  doc.build(story)
   return send_file(pdf_path, as_attachment=True)
 
 
@@ -232,36 +266,10 @@ def descargar_pdf():
 def descargar_excel():
   excel_path = "Reporte_CCTV_INJUL.xlsx"
   wb = openpyxl.Workbook()
-  wb.remove(wb.active)
-  hojas = [
-      "Resumen",
-      "1 Caribbean",
-      "2 Blue Mall",
-      "3 DCM",
-      "4 Outlet RP",
-      "5 Punta Cana",
-      "6 San Cristóbal",
-      "7 Santiago 1",
-      "8 Santiago 2",
-      "9 Muebles",
-      "Tickets",
-  ]
-  for nombre in hojas:
-    ws = wb.create_sheet(title=nombre)
-    ws["A1"] = f"INJUL - Consolidado de CCTV [{nombre}]"
-    ws["A1"].font = Font(name="Helvetica", size=14, bold=True, color="1F497D")
-    ws["A3"] = "#"
-    ws["B3"] = "Ubicación / Cámara"
-    ws["C3"] = "En Vivo"
-    ws["D3"] = "Grabación"
-    ws["E3"] = "Estado"
-    ws["F3"] = "Observaciones"
-    for col in ["A", "B", "C", "D", "E", "F"]:
-      cell = ws[f"{col}3"]
-      cell.fill = PatternFill(
-          start_color="1F497D", end_color="1F497D", fill_type="solid"
-      )
-      cell.font = Font(name="Helvetica", size=10, bold=True, color="FFFFFF")
+  ws = wb.active
+  ws.title = "Resumen"
+  ws["A1"] = "INJUL - Consolidado de CCTV"
+  ws["A1"].font = Font(name="Helvetica", size=14, bold=True, color="1F497D")
   wb.save(excel_path)
   return send_file(excel_path, as_attachment=True)
 
