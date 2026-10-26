@@ -1,4 +1,8 @@
-"""INJUL - Consolidado Maestro de CCTV (Flask + Postgres + Redis opcional)."""
+"""INJUL - Consolidado Maestro de CCTV.
+
+Flask + PostgreSQL (estado actual + historial trazable) + Redis (caché opcional).
+Cada cambio de estado u observación se guarda al instante y queda en el historial.
+"""
 
 import json
 import logging
@@ -11,8 +15,18 @@ from xml.sax.saxutils import escape
 import openpyxl
 import psycopg2
 import redis
-from flask import Flask, redirect, render_template_string, request, send_file, url_for
+from flask import (
+    Flask,
+    jsonify,
+    redirect,
+    render_template_string,
+    request,
+    send_file,
+    url_for,
+)
 from openpyxl.styles import Alignment, Font, PatternFill
+from reportlab.graphics.charts.barcharts import HorizontalBarChart
+from reportlab.graphics.shapes import Drawing, Rect, String
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle
@@ -43,7 +57,7 @@ app = Flask(__name__)
 DATABASE_URL = os.environ.get("DATABASE_URL")
 REDIS_URL = os.environ.get("REDIS_URL")
 CACHE_KEY = "cctv:datos_reporte"
-CACHE_TTL = 300  # segundos
+CACHE_TTL = 300  # segundos (la caché también se invalida en cada escritura)
 
 # --- REDIS (CACHÉ OPCIONAL: si falla, la app sigue funcionando sin caché) ---
 cache = None
@@ -142,9 +156,9 @@ ESTADOS = [
     ("No visible", "No visible (Rojo)"),
     ("Por verificar", "Por verificar"),
 ]
+ESTADOS_VALIDOS = {valor for valor, _ in ESTADOS}
 
 MENSAJES = {
-    "sucursal_ok": ("ok", "Estado de la sucursal guardado correctamente."),
     "ticket_ok": ("ok", "Ticket registrado correctamente."),
     "sin_db": ("error", "La base de datos no está configurada (falta DATABASE_URL)."),
     "error": ("error", "No se pudo guardar. Revisa los registros en Railway."),
@@ -166,6 +180,7 @@ HTML_TEMPLATE = """
         .btn { display: inline-block; background: #1F497D; color: white; padding: 10px 15px; text-decoration: none; border-radius: 4px; font-weight: bold; margin-top: 5px; margin-right: 5px; border: none; cursor: pointer; font-size: 14px; }
         .btn-excel { background: #217346; }
         .btn-ticket { background: #D9534F; }
+        .btn-gris { background: #6c757d; }
         .btn:hover { opacity: 0.9; }
         .form-group { margin-bottom: 10px; }
         label { display: block; font-weight: bold; font-size: 13px; margin-bottom: 3px; color: #444; }
@@ -173,26 +188,74 @@ HTML_TEMPLATE = """
         table { width: 100%; border-collapse: collapse; margin-top: 15px; }
         th, td { border: 1px solid #ddd; padding: 8px; text-align: center; font-size: 12px; }
         th { background-color: #1F497D; color: white; }
-        .camera-row { background: #fff; }
+        .estado-op td.celda-estado { background: #dff0d8; }
+        .estado-nv td.celda-estado { background: #f2dede; }
+        .estado-pv td.celda-estado { background: #fcf8e3; }
+        .marca { font-size: 11px; color: #777; white-space: nowrap; min-width: 80px; }
+        .marca.ok { color: #2d6a2d; }
+        .marca.error { color: #a94442; font-weight: bold; }
         .aviso { padding: 10px 14px; border-radius: 4px; margin-bottom: 15px; font-size: 14px; }
         .aviso.ok { background: #dff0d8; color: #2d6a2d; }
         .aviso.error { background: #f2dede; color: #a94442; }
+        .kpis { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 15px; }
+        .kpi { flex: 1; min-width: 110px; background: #f8f9fa; border-top: 3px solid #1F497D; padding: 8px; text-align: center; }
+        .kpi b { display: block; font-size: 22px; color: #1F497D; }
+        .kpi span { font-size: 11px; color: #666; }
         .tabla-scroll { overflow-x: auto; }
     </style>
     <script>
-        function actualizarCamaras() {
+        var CLASES = {'Operativa': 'estado-op', 'No visible': 'estado-nv', 'Por verificar': 'estado-pv'};
+
+        function mostrarSucursal() {
             var select = document.getElementById('sucursal-select');
             var listas = document.getElementsByClassName('lista-sucursal');
             for (var i = 0; i < listas.length; i++) {
-                var activa = (listas[i].id === 'sucursal-' + select.selectedIndex);
-                listas[i].style.display = activa ? 'block' : 'none';
-                var campos = listas[i].querySelectorAll('select, input');
-                for (var j = 0; j < campos.length; j++) {
-                    campos[j].disabled = !activa;
-                }
+                listas[i].style.display = (listas[i].id === 'sucursal-' + select.selectedIndex) ? 'block' : 'none';
             }
         }
-        window.onload = actualizarCamaras;
+
+        function actualizarResumen(r) {
+            document.getElementById('k-total').textContent = r.total;
+            document.getElementById('k-op').textContent = r.operativas;
+            document.getElementById('k-nv').textContent = r.no_visibles;
+            document.getElementById('k-pv').textContent = r.por_verificar;
+            document.getElementById('k-disp').textContent = r.disponibilidad.toFixed(1) + '%';
+        }
+
+        function guardarFila(tr) {
+            var marca = tr.querySelector('.marca');
+            var estado = tr.querySelector('select').value;
+            var obs = tr.querySelector('input').value;
+            marca.className = 'marca';
+            marca.textContent = 'Guardando...';
+            fetch('/api/camara', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({sucursal: tr.dataset.suc, idx: parseInt(tr.dataset.idx, 10), estado: estado, observacion: obs})
+            }).then(function (resp) {
+                return resp.json().then(function (j) { return {ok: resp.ok, j: j}; });
+            }).then(function (res) {
+                if (!res.ok || !res.j.ok) { throw new Error(res.j.error || 'Error'); }
+                tr.className = 'camera-row ' + (CLASES[estado] || 'estado-pv');
+                marca.className = 'marca ok';
+                marca.textContent = res.j.cambiado ? 'Guardado \u2713' : 'Sin cambios';
+                actualizarResumen(res.j.resumen);
+            }).catch(function () {
+                marca.className = 'marca error';
+                marca.textContent = 'NO guardado: reintenta';
+            });
+        }
+
+        window.onload = function () {
+            mostrarSucursal();
+            var filas = document.querySelectorAll('tr.camera-row');
+            for (var i = 0; i < filas.length; i++) {
+                (function (tr) {
+                    tr.querySelector('select').addEventListener('change', function () { guardarFila(tr); });
+                    tr.querySelector('input').addEventListener('change', function () { guardarFila(tr); });
+                })(filas[i]);
+            }
+        };
     </script>
 </head>
 <body>
@@ -201,57 +264,64 @@ HTML_TEMPLATE = """
 
         {% if mensaje %}<div class="aviso {{ tipo }}">{{ mensaje }}</div>{% endif %}
 
+        <div class="kpis">
+            <div class="kpi"><b id="k-total">{{ resumen.total }}</b><span>Cámaras</span></div>
+            <div class="kpi"><b id="k-op">{{ resumen.operativas }}</b><span>Operativas</span></div>
+            <div class="kpi"><b id="k-nv">{{ resumen.no_visibles }}</b><span>No visibles</span></div>
+            <div class="kpi"><b id="k-pv">{{ resumen.por_verificar }}</b><span>Por verificar</span></div>
+            <div class="kpi"><b id="k-disp">{{ '%.1f'|format(resumen.disponibilidad) }}%</b><span>Disponibilidad</span></div>
+        </div>
+
         <div class="card">
             <h3>Seleccionar Sucursal y Revisar Cámaras</h3>
-            <form action="/guardar-sucursal" method="POST">
-                <div class="form-group">
-                    <label>Sucursal:</label>
-                    <select id="sucursal-select" name="sucursal" onchange="actualizarCamaras()">
-                        {% for suc in catalogo.keys() %}
-                        <option value="{{ suc }}" {% if loop.index0 == seleccion %}selected{% endif %}>{{ suc }}</option>
-                        {% endfor %}
-                    </select>
-                </div>
+            <p style="font-size: 12px; color: #666; margin-top: 0;">
+                Cada cambio de estado u observación se guarda al instante y queda registrado en el historial.
+            </p>
+            <div class="form-group">
+                <label>Sucursal:</label>
+                <select id="sucursal-select" onchange="mostrarSucursal()">
+                    {% for suc in catalogo.keys() %}
+                    <option value="{{ suc }}" {% if loop.index0 == seleccion %}selected{% endif %}>{{ suc }}</option>
+                    {% endfor %}
+                </select>
+            </div>
 
-                {% for suc, camaras in catalogo.items() %}
-                {% set guardado = detalles.get(suc, {}) %}
-                <div id="sucursal-{{ loop.index0 }}" class="lista-sucursal" style="display:none; margin-top: 15px;">
-                    <h4 style="color: #1F497D; margin-bottom: 5px;">Cámaras de {{ suc }}</h4>
-                    <p style="font-size: 12px; color: #666;">Selecciona el estado de cada cámara para el reporte:</p>
-                    <div class="tabla-scroll">
-                    <table>
-                        <tr>
-                            <th>#</th>
-                            <th>Nombre de la Cámara (EZStation)</th>
-                            <th>Estado</th>
-                            <th>Observación</th>
-                        </tr>
-                        {% for cam in camaras %}
-                        {% set info = guardado.get(cam, {}) %}
-                        <tr class="camera-row">
-                            <td>{{ loop.index }}</td>
-                            <td style="text-align: left; font-weight: bold;">{{ cam }}</td>
-                            <td>
-                                <select name="estado_{{ loop.index0 }}" style="padding: 4px;">
-                                    {% for valor, texto in estados %}
-                                    <option value="{{ valor }}" {% if (info.get('estado') or 'Operativa') == valor %}selected{% endif %}>{{ texto }}</option>
-                                    {% endfor %}
-                                </select>
-                            </td>
-                            <td>
-                                <input type="text" name="obs_{{ loop.index0 }}" value="{{ info.get('observacion', '') }}" placeholder="Detalle si falla..." style="padding: 4px;">
-                            </td>
-                        </tr>
-                        {% endfor %}
-                    </table>
-                    </div>
+            {% for suc, camaras in catalogo.items() %}
+            {% set guardado = detalles.get(suc, {}) %}
+            <div id="sucursal-{{ loop.index0 }}" class="lista-sucursal" style="display:none; margin-top: 15px;">
+                <h4 style="color: #1F497D; margin-bottom: 5px;">Cámaras de {{ suc }}</h4>
+                <div class="tabla-scroll">
+                <table>
+                    <tr>
+                        <th>#</th>
+                        <th>Nombre de la Cámara (EZStation)</th>
+                        <th>Estado</th>
+                        <th>Observación</th>
+                        <th></th>
+                    </tr>
+                    {% for cam in camaras %}
+                    {% set info = guardado.get(cam, {}) %}
+                    {% set est = info.get('estado') or 'Por verificar' %}
+                    <tr class="camera-row {{ clases[est] }}" data-suc="{{ suc }}" data-idx="{{ loop.index0 }}">
+                        <td>{{ loop.index }}</td>
+                        <td style="text-align: left; font-weight: bold;">{{ cam }}</td>
+                        <td class="celda-estado">
+                            <select style="padding: 4px;">
+                                {% for valor, texto in estados %}
+                                <option value="{{ valor }}" {% if est == valor %}selected{% endif %}>{{ texto }}</option>
+                                {% endfor %}
+                            </select>
+                        </td>
+                        <td>
+                            <input type="text" value="{{ info.get('observacion', '') }}" maxlength="500" placeholder="Detalle si falla..." style="padding: 4px;">
+                        </td>
+                        <td class="marca"></td>
+                    </tr>
+                    {% endfor %}
+                </table>
                 </div>
-                {% endfor %}
-
-                <div style="margin-top: 15px;">
-                    <button type="submit" class="btn">💾 Guardar Estado de esta Sucursal</button>
-                </div>
-            </form>
+            </div>
+            {% endfor %}
         </div>
 
         <div class="card">
@@ -288,6 +358,53 @@ HTML_TEMPLATE = """
             <h3>Generación de Reportes Oficiales</h3>
             <a href="/descargar-pdf" class="btn">📥 Descargar PDF Oficial</a>
             <a href="/descargar-excel" class="btn btn-excel">📊 Descargar Excel Matriz</a>
+            <a href="/historial" class="btn btn-gris">🕘 Ver Historial de Cambios</a>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+HISTORIAL_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>INJUL - Historial CCTV</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #f4f6f9; color: #333; margin: 0; padding: 15px; }
+        .container { max-width: 1100px; margin: 0 auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+        h1 { color: #1F497D; font-size: 20px; border-bottom: 2px solid #1F497D; padding-bottom: 8px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th, td { border: 1px solid #ddd; padding: 6px; font-size: 12px; text-align: left; }
+        th { background: #1F497D; color: #fff; }
+        select, .btn { padding: 8px; font-size: 14px; }
+        .btn { background: #1F497D; color: #fff; text-decoration: none; border-radius: 4px; }
+        .tabla-scroll { overflow-x: auto; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Historial de cambios (últimos {{ filas|length }})</h1>
+        <form method="GET" action="/historial">
+            <select name="sucursal" onchange="this.form.submit()">
+                <option value="">Todas las sucursales</option>
+                {% for suc in catalogo.keys() %}
+                <option value="{{ suc }}" {% if suc == filtro %}selected{% endif %}>{{ suc }}</option>
+                {% endfor %}
+            </select>
+            <a class="btn" href="/">← Volver al panel</a>
+        </form>
+        <div class="tabla-scroll">
+        <table>
+            <tr><th>Fecha y hora</th><th>Sucursal</th><th>Cámara</th><th>Estado anterior</th><th>Estado nuevo</th><th>Observación anterior</th><th>Observación nueva</th><th>Origen</th></tr>
+            {% for f in filas %}
+            <tr>{% for campo in f %}<td>{{ campo }}</td>{% endfor %}</tr>
+            {% else %}
+            <tr><td colspan="8">Aún no hay cambios registrados.</td></tr>
+            {% endfor %}
+        </table>
         </div>
     </div>
 </body>
@@ -298,13 +415,34 @@ HTML_TEMPLATE = """
 # ----------------------------------------------------------------------------
 # Utilidades
 # ----------------------------------------------------------------------------
+CLASES_ESTADO = {
+    "Operativa": "estado-op",
+    "No visible": "estado-nv",
+    "Por verificar": "estado-pv",
+}
+
+
 def ahora():
     return datetime.now(ZONA_HORARIA) if ZONA_HORARIA else datetime.now()
+
+
+def local_txt(momento):
+    """Formatea un datetime de la base de datos en hora de Santo Domingo."""
+    if momento is None:
+        return ""
+    if ZONA_HORARIA and momento.tzinfo:
+        momento = momento.astimezone(ZONA_HORARIA)
+    return momento.strftime("%d/%m/%Y %I:%M:%S %p")
 
 
 def esc(texto):
     """Escapa texto para usarlo dentro de un Paragraph de ReportLab."""
     return escape(str(texto if texto is not None else ""))
+
+
+def ip_cliente():
+    reenviado = request.headers.get("X-Forwarded-For", "")
+    return (reenviado.split(",")[0].strip() or request.remote_addr or "")[:60]
 
 
 @contextmanager
@@ -344,6 +482,39 @@ def inicializar_base_de_datos():
                     detalle TEXT,
                     creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS estado_camaras_actual (
+                    sucursal VARCHAR(100) NOT NULL,
+                    camara VARCHAR(150) NOT NULL,
+                    estado VARCHAR(50) NOT NULL,
+                    observacion TEXT NOT NULL DEFAULT '',
+                    actualizado_en TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (sucursal, camara)
+                );
+                CREATE TABLE IF NOT EXISTS historial_cctv (
+                    id BIGSERIAL PRIMARY KEY,
+                    cambiado_en TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    sucursal VARCHAR(100) NOT NULL,
+                    camara VARCHAR(150) NOT NULL,
+                    estado_anterior VARCHAR(50),
+                    estado_nuevo VARCHAR(50) NOT NULL,
+                    observacion_anterior TEXT,
+                    observacion_nueva TEXT,
+                    origen VARCHAR(60)
+                );
+                CREATE INDEX IF NOT EXISTS idx_historial_fecha
+                    ON historial_cctv (cambiado_en DESC);
+                CREATE INDEX IF NOT EXISTS idx_historial_camara
+                    ON historial_cctv (sucursal, camara);
+            """)
+            # Migración única: si el estado actual está vacío, parte del último
+            # reporte diario guardado con la versión anterior de la app.
+            cur.execute("""
+                INSERT INTO estado_camaras_actual (sucursal, camara, estado, observacion)
+                SELECT sucursal, camara, estado, COALESCE(observacion, '')
+                FROM reportes_cctv_detalles
+                WHERE fecha = (SELECT MAX(fecha) FROM reportes_cctv_detalles)
+                  AND NOT EXISTS (SELECT 1 FROM estado_camaras_actual)
+                ON CONFLICT (sucursal, camara) DO NOTHING
             """)
     except Exception:  # noqa: BLE001
         logger.exception("Error inicializando la base de datos")
@@ -382,26 +553,29 @@ def cache_invalidar():
 
 
 def cargar_datos():
-    """Devuelve {'detalles': {sucursal: {camara: {...}}}, 'tickets': [[...]]}."""
+    """Devuelve {'detalles': {sucursal: {camara: {...}}}, 'tickets': [[...]], 'actualizado': str}."""
     datos = cache_leer()
     if datos is not None:
         return datos
 
-    datos = {"detalles": {}, "tickets": []}
+    datos = {"detalles": {}, "tickets": [], "actualizado": ""}
     if not DATABASE_URL:
         return datos
     try:
         with db_cursor() as cur:
             cur.execute("""
-                SELECT sucursal, camara, estado, observacion
-                FROM reportes_cctv_detalles
-                WHERE fecha = (SELECT MAX(fecha) FROM reportes_cctv_detalles)
+                SELECT sucursal, camara, estado, observacion, actualizado_en
+                FROM estado_camaras_actual
             """)
-            for suc, cam, est, obs in cur.fetchall():
+            ultima = None
+            for suc, cam, est, obs, momento in cur.fetchall():
                 datos["detalles"].setdefault(suc, {})[cam] = {
                     "estado": est,
                     "observacion": obs or "",
                 }
+                if ultima is None or momento > ultima:
+                    ultima = momento
+            datos["actualizado"] = local_txt(ultima)
             cur.execute("""
                 SELECT ticket, fecha, sucursal_area, estado, dias_abiertos, detalle
                 FROM reportes_tickets
@@ -417,6 +591,36 @@ def cargar_datos():
     return datos
 
 
+def cargar_historial(limite=200, sucursal=None):
+    """Últimos cambios registrados, más recientes primero (siempre desde la base de datos)."""
+    if not DATABASE_URL:
+        return []
+    consulta = """
+        SELECT cambiado_en, sucursal, camara, estado_anterior, estado_nuevo,
+               observacion_anterior, observacion_nueva, origen
+        FROM historial_cctv
+    """
+    params = []
+    if sucursal:
+        consulta += " WHERE sucursal = %s"
+        params.append(sucursal)
+    consulta += " ORDER BY id DESC LIMIT %s"
+    params.append(limite)
+    try:
+        with db_cursor() as cur:
+            cur.execute(consulta, params)
+            return [
+                [local_txt(f[0]), f[1], f[2], f[3] or "(sin registro)", f[4], f[5] or "", f[6] or "", f[7] or ""]
+                for f in cur.fetchall()
+            ]
+    except Exception:  # noqa: BLE001
+        logger.exception("Error leyendo el historial")
+        return []
+
+
+# ----------------------------------------------------------------------------
+# Cálculos
+# ----------------------------------------------------------------------------
 def estado_de(detalles, sucursal, camara):
     info = detalles.get(sucursal, {}).get(camara)
     return info["estado"] if info else "Por verificar"
@@ -445,6 +649,25 @@ def resumen_total(detalles):
         total, op, nv, pv = total + t, op + o, nv + n, pv + p
     disp = (op / total * 100) if total else 0
     return total, op, nv, pv, disp
+
+
+def resumen_dict(detalles):
+    total, op, nv, pv, disp = resumen_total(detalles)
+    return {
+        "total": total,
+        "operativas": op,
+        "no_visibles": nv,
+        "por_verificar": pv,
+        "disponibilidad": disp,
+    }
+
+
+def nivel(disp):
+    if disp >= 90:
+        return "Óptimo"
+    if disp >= 60:
+        return "Atención"
+    return "Crítico"
 
 
 # ----------------------------------------------------------------------------
@@ -479,8 +702,9 @@ class NumberedCanvas(canvas.Canvas):
         self.saveState()
         self.setFont("Helvetica", 9)
         self.setFillColor(colors.HexColor("#555555"))
-        self.drawString(36, 25, "INJUL Consolidado Maestro de CCTV  |  Documento confidencial")
-        self.drawRightString(letter[0] - 36, 25, f"Página {self._pageNumber} de {total_pages}")
+        self.drawString(36, 25, "INJUL - Consolidado Maestro de CCTV")
+        self.drawCentredString(letter[0] / 2, 25, f"Página {self._pageNumber} de {total_pages}")
+        self.drawRightString(letter[0] - 36, 25, "Documento confidencial")
         self.setStrokeColor(colors.HexColor("#CCCCCC"))
         self.setLineWidth(0.5)
         self.line(36, 38, letter[0] - 36, 38)
@@ -492,6 +716,7 @@ COLOR_ESTADO = {
     "No visible": "#F2DEDE",
     "Por verificar": "#FCF8E3",
 }
+COLOR_NIVEL = {"Óptimo": "#DFF0D8", "Atención": "#FCF8E3", "Crítico": "#F2DEDE"}
 
 
 def estilo_tabla(color_cabecera, extra=None):
@@ -509,6 +734,93 @@ def estilo_tabla(color_cabecera, extra=None):
     return TableStyle(comandos)
 
 
+def grafica_estado(detalles):
+    """Barras horizontales apiladas: operativas / no visibles / por verificar por sucursal."""
+    nombres, ops, nvs, pvs = [], [], [], []
+    for suc in CATALOGO_CAMARAS:
+        _, o, n, p, _ = resumen_sucursal(detalles, suc)
+        nombres.append(suc)
+        ops.append(o)
+        nvs.append(n)
+        pvs.append(p)
+    maximo = max((o + n + p) for o, n, p in zip(ops, nvs, pvs))
+    tope = ((maximo // 10) + 1) * 10
+
+    dibujo = Drawing(540, 215)
+    ch = HorizontalBarChart()
+    ch.x, ch.y, ch.width, ch.height = 150, 22, 370, 165
+    ch.data = [ops, nvs, pvs]
+    ch.categoryAxis.categoryNames = nombres
+    ch.categoryAxis.style = "stacked"
+    ch.categoryAxis.reverseDirection = 1
+    ch.categoryAxis.labels.fontName = "Helvetica"
+    ch.categoryAxis.labels.fontSize = 7
+    ch.categoryAxis.labels.boxAnchor = "e"
+    ch.categoryAxis.labels.dx = -4
+    ch.valueAxis.valueMin = 0
+    ch.valueAxis.valueMax = tope
+    ch.valueAxis.valueStep = 10
+    ch.valueAxis.labels.fontName = "Helvetica"
+    ch.valueAxis.labels.fontSize = 7
+    ch.bars[0].fillColor = colors.HexColor("#2E9E2E")
+    ch.bars[1].fillColor = colors.HexColor("#D64545")
+    ch.bars[2].fillColor = colors.HexColor("#F0A91E")
+    ch.bars.strokeColor = None
+    dibujo.add(ch)
+
+    x = 150
+    for etiqueta, color in [("Operativas", "#2E9E2E"), ("No visibles", "#D64545"), ("Por verificar", "#F0A91E")]:
+        dibujo.add(Rect(x, 199, 8, 8, fillColor=colors.HexColor(color), strokeColor=None))
+        dibujo.add(String(x + 12, 200, etiqueta, fontName="Helvetica", fontSize=7, fillColor=colors.HexColor("#333333")))
+        x += 85
+    dibujo.add(String(335, 6, "Cantidad de cámaras", fontName="Helvetica", fontSize=7, textAnchor="middle", fillColor=colors.HexColor("#555555")))
+    return dibujo
+
+
+def hallazgos(datos):
+    detalles, tickets = datos["detalles"], datos["tickets"]
+    total, op, nv, pv, disp = resumen_total(detalles)
+    niveles = [nivel(resumen_sucursal(detalles, s)[4]) for s in CATALOGO_CAMARAS]
+    n_suc = len(CATALOGO_CAMARAS)
+    lista = [
+        f"Disponibilidad global de {disp:.1f}%: {op} de {total} cámaras operativas en EZStation. "
+        f"{niveles.count('Crítico')} de {n_suc} sucursales están en nivel crítico y "
+        f"{niveles.count('Óptimo')} en nivel óptimo."
+    ]
+    peor = max(CATALOGO_CAMARAS, key=lambda s: resumen_sucursal(detalles, s)[2])
+    t_peor, _, nv_peor, _, _ = resumen_sucursal(detalles, peor)
+    if nv_peor:
+        lista.append(f"{peor}: {nv_peor} de {t_peor} cámaras no visibles en EZStation (la sucursal con más fallas).")
+    genericas = sum(
+        1
+        for suc, camaras in CATALOGO_CAMARAS.items()
+        for cam in camaras
+        if estado_de(detalles, suc, cam) == "No visible" and cam.startswith("IP Camera")
+    )
+    if nv:
+        lista.append(f"{genericas} de las {nv} cámaras no visibles conservan el nombre genérico de canal («IP Camera NN»).")
+    if pv:
+        donde = ", ".join(
+            f"{s} ({resumen_sucursal(detalles, s)[3]})"
+            for s in CATALOGO_CAMARAS
+            if resumen_sucursal(detalles, s)[3]
+        )
+        lista.append(f"{pv} cámaras están «Por verificar»: {donde}.")
+    abiertos = [t for t in tickets if t[3] == "En proceso"]
+    if abiertos:
+        dias = []
+        for t in abiertos:
+            try:
+                dias.append(int(t[4]))
+            except ValueError:
+                pass
+        extra = f"; el más antiguo lleva {max(dias)} días abierto" if dias else ""
+        lista.append(f"Hay {len(abiertos)} tickets en proceso con el proveedor de {len(tickets)} registrados{extra}.")
+    else:
+        lista.append(f"No hay tickets en proceso ({len(tickets)} registrados).")
+    return lista
+
+
 def construir_pdf(datos):
     detalles = datos["detalles"]
     tickets = datos["tickets"]
@@ -522,72 +834,110 @@ def construir_pdf(datos):
         bottomMargin=50,
     )
     title_style = ParagraphStyle(
-        "TitleStyle",
-        fontName="Helvetica-Bold",
-        fontSize=15,
-        leading=19,
+        "TitleStyle", fontName="Helvetica-Bold", fontSize=15, leading=19,
+        textColor=colors.HexColor("#1F497D"),
+    )
+    seccion_style = ParagraphStyle(
+        "SeccionStyle", fontName="Helvetica-Bold", fontSize=9, leading=12,
         textColor=colors.HexColor("#1F497D"),
     )
     normal_style = ParagraphStyle(
-        "NormalStyle",
-        fontName="Helvetica",
-        fontSize=10,
-        leading=14,
+        "NormalStyle", fontName="Helvetica", fontSize=10, leading=14,
         textColor=colors.HexColor("#333333"),
     )
     celda = ParagraphStyle("Celda", fontName="Helvetica", fontSize=8, leading=10)
     story = []
 
-    # --- PORTADA ---
+    # --- PÁGINA 1: PORTADA + INDICADORES + ESTADO POR SUCURSAL + GRÁFICA ---
     fecha_txt = ahora().strftime("%d/%m/%Y")
     logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
     encabezado = Paragraph(
-        "<b>INJUL - Consolidado Maestro de CCTV</b><br/>"
-        "<font size=9 color='#555555'>Investigadores Jurídicos EIRL<br/>"
-        f"Fecha: {fecha_txt} | Rango: 07:00 AM - 07:00 PM</font>",
+        "<b>INFORME CONSOLIDADO DE CCTV</b><br/>"
+        "<font size=8 color='#555555'>Investigadores Jurídicos EIRL - Supervisión en EZStation<br/>"
+        f"Fecha: {fecha_txt} | Rango: 07:00 AM - 07:00 PM<br/>"
+        "Elaborado por: Centro de Monitoreo INJUL</font>",
         title_style,
     )
     if os.path.exists(logo_path):
-        logo_img = Image(logo_path, width=1.1 * inch, height=1.1 * inch)
-        t_header = Table([[logo_img, encabezado]], colWidths=[85, 455])
+        logo_img = Image(logo_path, width=0.9 * inch, height=0.9 * inch)
+        t_header = Table([[logo_img, encabezado]], colWidths=[75, 465])
         t_header.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE")]))
         story.append(t_header)
     else:
         story.append(encabezado)
-    story.append(Spacer(1, 15))
+    story.append(Spacer(1, 10))
 
     total, op, nv, pv, disp = resumen_total(detalles)
-    kpi_data = [
-        ["Cámaras Totales", "Operativas", "No Visibles", "Por Verificar", "Disponibilidad"],
-        [str(total), str(op), str(nv), str(pv), f"{disp:.1f}%"],
+    en_proceso = sum(1 for t in tickets if t[3] == "En proceso")
+    pct = lambda x: f"{(x / total * 100) if total else 0:.0f}% del total"  # noqa: E731
+    story.append(Paragraph("INDICADORES CLAVE", seccion_style))
+    kpi = [
+        ["Cámaras supervisadas", "Operativas", "No visibles", "Por verificar", "Disponibilidad", "Tickets en proceso"],
+        [str(total), str(op), str(nv), str(pv), f"{disp:.1f}%", str(en_proceso)],
+        [f"en {len(CATALOGO_CAMARAS)} sucursales", pct(op), pct(nv), "por confirmar", "operativas / total", f"de {len(tickets)} registrados"],
     ]
-    t_kpi = Table(kpi_data, colWidths=[100, 100, 100, 100, 140])
+    t_kpi = Table(kpi, colWidths=[90] * 6)
     t_kpi.setStyle(
-        estilo_tabla("#1F497D", [("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#F2F2F2"))])
+        TableStyle([
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 7),
+            ("FONTNAME", (0, 1), (-1, 1), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 1), (-1, 1), 16),
+            ("FONTSIZE", (0, 2), (-1, 2), 7),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#555555")),
+            ("TEXTCOLOR", (1, 1), (1, 1), colors.HexColor("#2E9E2E")),
+            ("TEXTCOLOR", (2, 1), (2, 1), colors.HexColor("#D64545")),
+            ("TEXTCOLOR", (3, 1), (3, 1), colors.HexColor("#C98A00")),
+            ("TEXTCOLOR", (0, 1), (0, 1), colors.HexColor("#1F497D")),
+            ("TEXTCOLOR", (4, 1), (5, 1), colors.HexColor("#1F497D")),
+            ("TEXTCOLOR", (0, 2), (-1, 2), colors.HexColor("#777777")),
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F8F9FA")),
+            ("LINEABOVE", (0, 0), (-1, 0), 1.5, colors.HexColor("#1F497D")),
+            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#DDDDDD")),
+        ])
     )
     story.append(t_kpi)
+    story.append(Spacer(1, 10))
+
+    story.append(Paragraph("ESTADO POR SUCURSAL", seccion_style))
+    story.append(Paragraph(
+        "<font size=6 color='#777777'>Disponibilidad = cámaras operativas / total de cámaras de la sucursal. "
+        "Nivel: Óptimo ≥ 90 % · Atención 60-89 % · Crítico &lt; 60 %.</font>", normal_style))
+    filas = [["#", "Sucursal", "Total", "Operativas", "No visibles", "Por verificar", "Disponib.", "Nivel"]]
+    extra = [("ALIGN", (1, 1), (1, -1), "LEFT")]
+    for i, suc in enumerate(CATALOGO_CAMARAS, start=1):
+        t, o, n, p, d = resumen_sucursal(detalles, suc)
+        niv = nivel(d)
+        filas.append([str(i), suc, str(t), str(o), str(n), str(p), f"{d:.1f}%", niv])
+        extra.append(("BACKGROUND", (7, i), (7, i), colors.HexColor(COLOR_NIVEL[niv])))
+    filas.append(["", "TOTAL GENERAL", str(total), str(op), str(nv), str(pv), f"{disp:.1f}%", nivel(disp)])
+    extra += [
+        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+        ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#E9EEF5")),
+        ("BACKGROUND", (7, -1), (7, -1), colors.HexColor(COLOR_NIVEL[nivel(disp)])),
+    ]
+    t_res = Table(filas, colWidths=[22, 150, 40, 62, 62, 70, 70, 64], repeatRows=1)
+    t_res.setStyle(estilo_tabla("#1F497D", extra))
+    story.append(t_res)
+    story.append(Spacer(1, 10))
+
+    story.append(Paragraph("DISTRIBUCIÓN DEL ESTADO POR SUCURSAL", seccion_style))
+    story.append(grafica_estado(detalles))
     story.append(PageBreak())
 
-    # --- HALLAZGOS Y RESUMEN ---
-    story.append(Paragraph("<b>Hallazgos del Día y Resumen de Tickets</b>", title_style))
+    # --- PÁGINA 2: HALLAZGOS ---
+    story.append(Paragraph("<b>Hallazgos del Día</b>", title_style))
     story.append(Spacer(1, 10))
-    en_proceso = sum(1 for t in tickets if t[3] == "En proceso")
-    story.append(
-        Paragraph(
-            "1. Monitoreo activo de la red de sucursales en EZStation.<br/>"
-            "2. Seguimiento de incidencias técnicas detalladas por cámara.<br/>"
-            f"3. Tickets registrados: {len(tickets)} (en proceso: {en_proceso}).",
-            normal_style,
-        )
-    )
-    story.append(Spacer(1, 12))
-    filas = [["Sucursal", "Total", "Operativas", "No visibles", "Por verificar", "Disponib."]]
-    for suc in CATALOGO_CAMARAS:
-        t, o, n, p, d = resumen_sucursal(detalles, suc)
-        filas.append([Paragraph(esc(suc), celda), str(t), str(o), str(n), str(p), f"{d:.1f}%"])
-    t_res = Table(filas, colWidths=[190, 50, 70, 70, 80, 80], repeatRows=1)
-    t_res.setStyle(estilo_tabla("#1F497D"))
-    story.append(t_res)
+    for n, texto in enumerate(hallazgos(datos), start=1):
+        story.append(Paragraph(f"<b>{n}.</b> {esc(texto)}", normal_style))
+        story.append(Spacer(1, 6))
+    if datos.get("actualizado"):
+        story.append(Spacer(1, 6))
+        story.append(Paragraph(
+            f"<font size=8 color='#777777'>Último cambio registrado en el sistema: {esc(datos['actualizado'])}</font>",
+            normal_style))
     story.append(PageBreak())
 
     # --- UNA SECCIÓN POR SUCURSAL ---
@@ -616,12 +966,8 @@ def construir_pdf(datos):
     if tickets:
         for t in tickets:
             filas.append([
-                Paragraph(esc(t[0]), celda),
-                t[1],
-                Paragraph(esc(t[2]), celda),
-                t[3],
-                t[4],
-                Paragraph(esc(t[5]), celda),
+                Paragraph(esc(t[0]), celda), t[1], Paragraph(esc(t[2]), celda),
+                t[3], t[4], Paragraph(esc(t[5]), celda),
             ])
     else:
         filas.append(["N/A", "N/A", "Sin tickets registrados", "N/A", "0", "N/A"])
@@ -637,7 +983,7 @@ def construir_pdf(datos):
 # ----------------------------------------------------------------------------
 # Excel
 # ----------------------------------------------------------------------------
-def construir_excel(datos):
+def construir_excel(datos, historial):
     detalles = datos["detalles"]
     tickets = datos["tickets"]
     azul = PatternFill("solid", fgColor="1F497D")
@@ -662,17 +1008,17 @@ def construir_excel(datos):
     ws["A1"] = "INJUL - Consolidado de CCTV"
     ws["A1"].font = Font(size=14, bold=True, color="1F497D")
     ws["A2"] = f"Fecha: {ahora().strftime('%d/%m/%Y')}"
-    cabecera(ws, 4, ["Sucursal", "Total", "Operativas", "No visibles", "Por verificar", "Disponibilidad %"])
+    cabecera(ws, 4, ["Sucursal", "Total", "Operativas", "No visibles", "Por verificar", "Disponibilidad %", "Nivel"])
     fila = 5
     for suc in CATALOGO_CAMARAS:
         t, o, n, p, d = resumen_sucursal(detalles, suc)
-        for col, valor in enumerate([suc, t, o, n, p, round(d, 1)], start=1):
+        for col, valor in enumerate([suc, t, o, n, p, round(d, 1), nivel(d)], start=1):
             ws.cell(row=fila, column=col, value=valor)
         fila += 1
     t, o, n, p, d = resumen_total(detalles)
-    for col, valor in enumerate(["TOTAL", t, o, n, p, round(d, 1)], start=1):
+    for col, valor in enumerate(["TOTAL", t, o, n, p, round(d, 1), nivel(d)], start=1):
         ws.cell(row=fila, column=col, value=valor).font = Font(bold=True)
-    for col, ancho in zip("ABCDEF", [34, 10, 12, 13, 14, 18]):
+    for col, ancho in zip("ABCDEFG", [34, 10, 12, 13, 14, 18, 12]):
         ws.column_dimensions[col].width = ancho
 
     # Hoja 2: matriz de cámaras
@@ -701,6 +1047,17 @@ def construir_excel(datos):
     for col, ancho in zip("ABCDEF", [14, 14, 30, 14, 14, 60]):
         wt.column_dimensions[col].width = ancho
 
+    # Hoja 4: historial de cambios (trazabilidad)
+    wh = wb.create_sheet("Historial")
+    cabecera(wh, 1, ["Fecha y hora", "Sucursal", "Cámara", "Estado anterior", "Estado nuevo",
+                     "Observación anterior", "Observación nueva", "Origen"])
+    for fila, h in enumerate(historial, start=2):
+        for col, valor in enumerate(h, start=1):
+            wh.cell(row=fila, column=col, value=valor)
+    wh.freeze_panes = "A2"
+    for col, ancho in zip("ABCDEFGH", [24, 28, 34, 16, 16, 36, 36, 16]):
+        wh.column_dimensions[col].width = ancho
+
     buffer = BytesIO()
     wb.save(buffer)
     buffer.seek(0)
@@ -722,55 +1079,82 @@ def index():
         seleccion = int(request.args.get("s", 0))
     except ValueError:
         seleccion = 0
+    datos = cargar_datos()
     return render_template_string(
         HTML_TEMPLATE,
         catalogo=CATALOGO_CAMARAS,
-        detalles=cargar_datos()["detalles"],
+        detalles=datos["detalles"],
+        resumen=resumen_dict(datos["detalles"]),
         estados=ESTADOS,
+        clases=CLASES_ESTADO,
         mensaje=mensaje,
         tipo=tipo,
         seleccion=seleccion,
     )
 
 
-@app.route("/guardar-sucursal", methods=["POST"])
-def guardar_sucursal():
-    sucursal = request.form.get("sucursal")
+@app.route("/api/camara", methods=["POST"])
+def api_camara():
+    """Guarda al instante el estado/observación de UNA cámara y registra el cambio en el historial."""
+    datos_in = request.get_json(silent=True) or {}
+    sucursal = datos_in.get("sucursal")
+    estado = datos_in.get("estado")
+    observacion = str(datos_in.get("observacion") or "").strip()[:500]
+    idx = datos_in.get("idx")
+
     if sucursal not in CATALOGO_CAMARAS:
-        return redirect(url_for("index", msg="error"))
-    seleccion = list(CATALOGO_CAMARAS).index(sucursal)
+        return jsonify(ok=False, error="Sucursal no válida"), 400
+    if not isinstance(idx, int) or isinstance(idx, bool) or not 0 <= idx < len(CATALOGO_CAMARAS[sucursal]):
+        return jsonify(ok=False, error="Cámara no válida"), 400
+    if estado not in ESTADOS_VALIDOS:
+        return jsonify(ok=False, error="Estado no válido"), 400
     if not DATABASE_URL:
-        return redirect(url_for("index", msg="sin_db", s=seleccion))
+        return jsonify(ok=False, error="Base de datos no configurada"), 503
 
-    fecha_hoy = ahora().strftime("%Y-%m-%d")
-    validos = {valor for valor, _ in ESTADOS}
-    filas = []
-    for i, cam in enumerate(CATALOGO_CAMARAS[sucursal]):
-        estado = request.form.get(f"estado_{i}") or "Operativa"
-        if estado not in validos:
-            estado = "Por verificar"
-        obs = (request.form.get(f"obs_{i}") or "").strip()
-        filas.append((fecha_hoy, sucursal, cam, estado, obs))
-
+    camara = CATALOGO_CAMARAS[sucursal][idx]
     try:
         with db_cursor() as cur:
             cur.execute(
-                "DELETE FROM reportes_cctv_detalles WHERE fecha = %s AND sucursal = %s",
-                (fecha_hoy, sucursal),
-            )
-            cur.executemany(
                 """
-                INSERT INTO reportes_cctv_detalles (fecha, sucursal, camara, estado, observacion)
-                VALUES (%s, %s, %s, %s, %s)
+                SELECT estado, observacion FROM estado_camaras_actual
+                WHERE sucursal = %s AND camara = %s FOR UPDATE
                 """,
-                filas,
+                (sucursal, camara),
             )
+            previo = cur.fetchone()
+            est_ant = previo[0] if previo else None
+            obs_ant = (previo[1] or "") if previo else None
+            cambiado = previo is None or est_ant != estado or obs_ant != observacion
+            if cambiado:
+                cur.execute(
+                    """
+                    INSERT INTO estado_camaras_actual (sucursal, camara, estado, observacion, actualizado_en)
+                    VALUES (%s, %s, %s, %s, NOW())
+                    ON CONFLICT (sucursal, camara) DO UPDATE
+                    SET estado = EXCLUDED.estado,
+                        observacion = EXCLUDED.observacion,
+                        actualizado_en = NOW()
+                    """,
+                    (sucursal, camara, estado, observacion),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO historial_cctv
+                        (sucursal, camara, estado_anterior, estado_nuevo,
+                         observacion_anterior, observacion_nueva, origen)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (sucursal, camara, est_ant, estado, obs_ant, observacion, ip_cliente()),
+                )
     except Exception:  # noqa: BLE001
-        logger.exception("Error guardando sucursal")
-        return redirect(url_for("index", msg="error", s=seleccion))
+        logger.exception("Error guardando cámara")
+        return jsonify(ok=False, error="No se pudo guardar"), 500
 
+    # La escritura ya está confirmada en Postgres: se invalida Redis y se recarga
+    # de inmediato, así el panel y el próximo reporte ya ven el dato nuevo.
     cache_invalidar()
-    return redirect(url_for("index", msg="sucursal_ok", s=seleccion))
+    datos = cargar_datos()
+    return jsonify(ok=True, cambiado=cambiado, resumen=resumen_dict(datos["detalles"]))
 
 
 @app.route("/guardar-ticket", methods=["POST"])
@@ -806,7 +1190,21 @@ def guardar_ticket():
         return redirect(url_for("index", msg="error"))
 
     cache_invalidar()
+    cargar_datos()
     return redirect(url_for("index", msg="ticket_ok"))
+
+
+@app.route("/historial")
+def historial():
+    filtro = request.args.get("sucursal") or ""
+    if filtro not in CATALOGO_CAMARAS:
+        filtro = ""
+    return render_template_string(
+        HISTORIAL_TEMPLATE,
+        filas=cargar_historial(200, filtro or None),
+        catalogo=CATALOGO_CAMARAS,
+        filtro=filtro,
+    )
 
 
 @app.route("/descargar-pdf")
@@ -822,7 +1220,7 @@ def descargar_pdf():
 
 @app.route("/descargar-excel")
 def descargar_excel():
-    buffer = construir_excel(cargar_datos())
+    buffer = construir_excel(cargar_datos(), cargar_historial(5000))
     return send_file(
         buffer,
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
