@@ -302,7 +302,6 @@ HTML_TEMPLATE = """
             if (activo) {
                 activo.style.display = 'block';
             }
-            // Asignar nombre real al input hidden
             var selectedOption = select.options[select.selectedIndex];
             document.getElementById('nombre-sucursal').value = selectedOption.text;
         }
@@ -506,31 +505,4 @@ def guardar_sucursal():
       )
 
       camaras = CATALOGO_CAMARAS[sucursal]
-      for i, cam in enumerate(camaras):
-        estado = request.form.get(f"estado_{i}") or "Operativa"
-        obs = request.form.get(f"obs_{i}") or ""
-        cur.execute(
-            """
-                    INSERT INTO reportes_cctv_detalles (fecha, sucursal, camara, estado, observacion)
-                    VALUES (%s, %s, %s, %s, %s)
-                """,
-            (fecha_hoy, sucursal, cam, estado, obs),
-        )
-
-      conn.commit()
-      cur.close()
-      conn.close()
-    except Exception as e:
-      print(f"Error guardando sucursal: {e}")
-
-  return redirect(url_for("index"))
-
-
-@app.route("/guardar-ticket", methods=["POST"])
-def guardar_ticket():
-  ticket = request.form.get("ticket")
-  sucursal_area = request.form.get("sucursal_area")
-  estado_ticket = request.form.get("estado_ticket")
-  dias_abiertos = request.form.get("dias_abiertos") or 0
-  detalle = request.form.get("detalle")
-  fecha_hoy = datetime.now().
+      for i, cam in enumerate
