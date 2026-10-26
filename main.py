@@ -20,7 +20,7 @@ from reportlab.platypus import (
 
 app = Flask(__name__)
 
-# --- HTML DE LA INTERFAZ WEB ---
+# --- HTML DE LA INTERFAZ WEB COMPLETA ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="es">
@@ -30,12 +30,13 @@ HTML_TEMPLATE = """
     <title>INJUL - Consolidado CCTV</title>
     <style>
         body { font-family: Arial, sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 15px; }
-        .container { max-width: 900px; margin: 0 auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+        .container { max-width: 950px; margin: 0 auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
         h1 { color: #1F497D; font-size: 20px; border-bottom: 2px solid #1F497D; padding-bottom: 8px; }
         h3 { color: #1F497D; margin-top: 5px; }
         .card { background: #f8f9fa; padding: 15px; margin-bottom: 15px; border-radius: 6px; border-left: 4px solid #1F497D; }
         .btn { display: inline-block; background: #1F497D; color: white; padding: 10px 15px; text-decoration: none; border-radius: 4px; font-weight: bold; margin-top: 5px; margin-right: 5px; border: none; cursor: pointer; font-size: 14px; }
         .btn-excel { background: #217346; }
+        .btn-ticket { background: #D9534F; }
         .btn:hover { opacity: 0.9; }
         .form-group { margin-bottom: 10px; }
         label { display: block; font-weight: bold; font-size: 13px; margin-bottom: 3px; color: #444; }
@@ -49,8 +50,9 @@ HTML_TEMPLATE = """
     <div class="container">
         <h1>INJUL - Sistema de Monitoreo CCTV</h1>
         
+        <!-- Formulario 1: Estado de Sucursal -->
         <div class="card">
-            <h3>Registrar Estado de Sucursal</h3>
+            <h3>1. Registrar Estado de Sucursal</h3>
             <form action="/guardar" method="POST">
                 <div class="form-group">
                     <label>Sucursal:</label>
@@ -78,18 +80,51 @@ HTML_TEMPLATE = """
                     <label>Observaciones / Novedades:</label>
                     <textarea name="observaciones" rows="2" placeholder="Detalles de cámaras o cableado..."></textarea>
                 </div>
-                <button type="submit" class="btn">💾 Guardar en Base de Datos</button>
+                <button type="submit" class="btn">💾 Guardar Estado de Sucursal</button>
             </form>
         </div>
 
+        <!-- Formulario 2: Tickets y Novedades -->
+        <div class="card">
+            <h3>2. Registrar Ticket o Novedad con Proveedor</h3>
+            <form action="/guardar-ticket" method="POST">
+                <div class="form-group">
+                    <label>Número de Ticket:</label>
+                    <input type="text" name="ticket" required placeholder="Ej: 10437 o SIN TICKET">
+                </div>
+                <div class="form-group">
+                    <label>Sucursal o Área Afectada:</label>
+                    <input type="text" name="sucursal_area" required placeholder="Ej: Marmotech DCM / San Cristóbal">
+                </div>
+                <div class="form-group">
+                    <label>Estado del Ticket:</label>
+                    <select name="estado_ticket">
+                        <option value="En proceso">En proceso</option>
+                        <option value="Terminado">Terminado</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Días Abiertos (o cálculo):</label>
+                    <input type="number" name="dias_abiertos" value="0" placeholder="Ej: 5">
+                </div>
+                <div class="form-group">
+                    <label>Detalle del Reporte:</label>
+                    <textarea name="detalle" rows="2" placeholder="Descripción de la falla..."></textarea>
+                </div>
+                <button type="submit" class="btn btn-ticket">📝 Registrar Ticket</button>
+            </form>
+        </div>
+
+        <!-- Botones de Descarga -->
         <div class="card">
             <h3>Generación de Reportes Oficiales</h3>
             <a href="/descargar-pdf" class="btn">📥 Descargar PDF Oficial (13 Págs)</a>
             <a href="/descargar-excel" class="btn btn-excel">📊 Descargar Excel Matriz</a>
         </div>
 
+        <!-- Historial de Sucursales -->
         <div class="card">
-            <h3>Historial Reciente en PostgreSQL</h3>
+            <h3>Historial Reciente de Sucursales</h3>
             <table>
                 <tr>
                     <th>Fecha</th>
@@ -98,7 +133,7 @@ HTML_TEMPLATE = """
                     <th>No Visibles</th>
                     <th>Observaciones</th>
                 </tr>
-                {% for row in registros %}
+                {% for row in registros_cctv %}
                 <tr>
                     <td>{{ row[1] }}</td>
                     <td>{{ row[2] }}</td>
@@ -108,7 +143,36 @@ HTML_TEMPLATE = """
                 </tr>
                 {% else %}
                 <tr>
-                    <td colspan="5">No hay registros guardados todavía.</td>
+                    <td colspan="5">No hay registros de sucursales todavía.</td>
+                </tr>
+                {% endfor %}
+            </table>
+        </div>
+
+        <!-- Historial de Tickets -->
+        <div class="card">
+            <h3>Historial Reciente de Tickets</h3>
+            <table>
+                <tr>
+                    <th>Fecha</th>
+                    <th>Ticket</th>
+                    <th>Área / Sucursal</th>
+                    <th>Estado</th>
+                    <th>Días</th>
+                    <th>Detalle</th>
+                </tr>
+                {% for row in registros_tickets %}
+                <tr>
+                    <td>{{ row[1] }}</td>
+                    <td>{{ row[2] }}</td>
+                    <td>{{ row[3] }}</td>
+                    <td>{{ row[4] }}</td>
+                    <td>{{ row[5] }}</td>
+                    <td>{{ row[6] }}</td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="6">No hay tickets registrados todavía.</td>
                 </tr>
                 {% endfor %}
             </table>
@@ -148,7 +212,7 @@ class NumberedCanvas(canvas.Canvas):
     self.drawCentredString(0, 0, "CONFIDENCIAL")
     self.restoreState()
 
-    # Pie de página
+    # Pie de página oficial
     self.saveState()
     self.setFont("Helvetica", 9)
     self.setFillColor(colors.HexColor("#555555"))
@@ -182,6 +246,16 @@ def inicializar_base_de_datos():
                 observaciones TEXT,
                 creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS reportes_tickets (
+                id SERIAL PRIMARY KEY,
+                fecha DATE NOT NULL,
+                ticket VARCHAR(50) NOT NULL,
+                sucursal_area VARCHAR(150) NOT NULL,
+                estado VARCHAR(50) NOT NULL,
+                dias_abiertos INT DEFAULT 0,
+                detalle TEXT,
+                creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
         """)
     conn.commit()
     cur.close()
@@ -192,7 +266,8 @@ def inicializar_base_de_datos():
 
 @app.route("/")
 def index():
-  registros = []
+  registros_cctv = []
+  registros_tickets = []
   database_url = os.environ.get("DATABASE_URL")
   if database_url:
     try:
@@ -200,15 +275,26 @@ def index():
       cur = conn.cursor()
       cur.execute(
           "SELECT id, fecha, sucursal, operativas, no_visibles, observaciones"
-          " FROM reportes_cctv ORDER BY id DESC LIMIT 15;"
+          " FROM reportes_cctv ORDER BY id DESC LIMIT 10;"
       )
-      registros = cur.fetchall()
+      registros_cctv = cur.fetchall()
+
+      cur.execute(
+          "SELECT id, fecha, ticket, sucursal_area, estado, dias_abiertos,"
+          " detalle FROM reportes_tickets ORDER BY id DESC LIMIT 10;"
+      )
+      registros_tickets = cur.fetchall()
+
       cur.close()
       conn.close()
     except Exception as e:
       print(f"Error leyendo DB: {e}")
 
-  return render_template_string(HTML_TEMPLATE, registros=registros)
+  return render_template_string(
+      HTML_TEMPLATE,
+      registros_cctv=registros_cctv,
+      registros_tickets=registros_tickets,
+  )
 
 
 @app.route("/guardar", methods=["POST"])
@@ -246,6 +332,43 @@ def guardar():
   return redirect(url_for("index"))
 
 
+@app.route("/guardar-ticket", methods=["POST"])
+def guardar_ticket():
+  ticket = request.form.get("ticket")
+  sucursal_area = request.form.get("sucursal_area")
+  estado_ticket = request.form.get("estado_ticket")
+  dias_abiertos = request.form.get("dias_abiertos") or 0
+  detalle = request.form.get("detalle")
+  fecha_hoy = datetime.now().strftime("%Y-%m-%d")
+
+  database_url = os.environ.get("DATABASE_URL")
+  if database_url:
+    try:
+      conn = psycopg2.connect(database_url)
+      cur = conn.cursor()
+      cur.execute(
+          """
+                INSERT INTO reportes_tickets (fecha, ticket, sucursal_area, estado, dias_abiertos, detalle)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+          (
+              fecha_hoy,
+              ticket,
+              sucursal_area,
+              estado_ticket,
+              int(dias_abiertos),
+              detalle,
+          ),
+      )
+      conn.commit()
+      cur.close()
+      conn.close()
+    except Exception as e:
+      print(f"Error guardando ticket: {e}")
+
+  return redirect(url_for("index"))
+
+
 @app.route("/descargar-pdf")
 def descargar_pdf():
   pdf_path = "Reporte_CCTV_INJUL.pdf"
@@ -273,14 +396,14 @@ def descargar_pdf():
       textColor=colors.HexColor("#333333"),
   )
 
-  # --- OBTENER DATOS DE LA BASE DE DATOS ---
+  # --- OBTENER DATOS DE SUCURSALES DESDE LA DB ---
   datos_sucursales = {}
+  lista_tickets_db = []
   database_url = os.environ.get("DATABASE_URL")
   if database_url:
     try:
       conn = psycopg2.connect(database_url)
       cur = conn.cursor()
-      # Traer el registro más reciente por sucursal
       cur.execute("""
                 SELECT DISTINCT ON (sucursal) sucursal, operativas, no_visibles, observaciones, fecha
                 FROM reportes_cctv
@@ -294,6 +417,13 @@ def descargar_pdf():
             "observaciones": r[3] or "",
             "fecha": str(r[4]),
         }
+
+      cur.execute("""
+                SELECT ticket, fecha, sucursal_area, estado, dias_abiertos, detalle
+                FROM reportes_tickets
+                ORDER BY id DESC;
+            """)
+      lista_tickets_db = cur.fetchall()
       cur.close()
       conn.close()
     except Exception as e:
@@ -341,14 +471,14 @@ def descargar_pdf():
   story.append(t_kpi)
   story.append(PageBreak())
 
-  # --- PÁGINA 2: HALLAZGOS Y SEGUIMIENTO ---
+  # --- PÁGINA 2: HALLAZGOS Y RESUMEN ---
   story.append(Paragraph("<b>Hallazgos del Día y Resumen de Tickets</b>", title_style))
   story.append(Spacer(1, 10))
   hallazgos_texto = Paragraph(
       "1. Disponibilidad global de 54.3%: 121 de 223 cámaras operativas en"
-      " EZStation.<br/>2. Hay 9 tickets en proceso con el proveedor; el más"
-      " antiguo lleva 487 días abierto.<br/>3. Se recomienda revisión de"
-      " cableado y conectividad en las sucursales con nivel crítico.",
+      " EZStation.<br/>2. Seguimiento activo de novedades y sucursales en"
+      " nivel crítico.<br/>3. Se detallan los registros ingresados en la"
+      " plataforma de monitoreo.",
       normal_style,
   )
   story.append(hallazgos_texto)
@@ -401,15 +531,18 @@ def descargar_pdf():
     story.append(t_branch)
     story.append(PageBreak())
 
-  # --- PÁGINA 12 Y 13: SEGUIMIENTO DE TICKETS CON EL PROVEEDOR ---
+  # --- PÁGINAS FINALES: SEGUIMIENTO DE TICKETS CON EL PROVEEDOR ---
   story.append(Paragraph("<b>Seguimiento de Tickets con el Proveedor</b>", title_style))
   story.append(Spacer(1, 10))
-  tickets_data = [
-      ["Ticket", "Fecha", "Sucursal / Área", "Estado", "Días Abiertos"],
-      ["9921", "20/06/2025", "San Cristóbal", "En proceso", "487"],
-      ["9924", "20/06/2025", "Marmotech DCM", "En proceso", "457"],
-  ]
-  t_tickets = Table(tickets_data, colWidths=[70, 80, 130, 100, 90])
+
+  tickets_tabla_data = [["Ticket", "Fecha", "Sucursal / Área", "Estado", "Días", "Detalle"]]
+  if lista_tickets_db:
+    for t in lista_tickets_db:
+      tickets_tabla_data.append([str(t[0]), str(t[1]), str(t[2]), str(t[3]), str(t[4]), str(t[5])])
+  else:
+    tickets_tabla_data.append(["N/A", "N/A", "Sin tickets registrados", "N/A", "0", "N/A"])
+
+  t_tickets = Table(tickets_tabla_data, colWidths=[60, 75, 120, 80, 45, 150])
   t_tickets.setStyle(
       TableStyle([
           ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F497D")),
@@ -417,22 +550,11 @@ def descargar_pdf():
           ("ALIGN", (0, 0), (-1, -1), "CENTER"),
           ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
           ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
-          ("FONTSIZE", (0, 0), (-1, -1), 9),
+          ("FONTSIZE", (0, 0), (-1, -1), 8),
       ])
   )
   story.append(t_tickets)
   story.append(PageBreak())
-
-  # Última página de cierre para completar el bloque
-  story.append(Paragraph("<b>Cierre del Consolidado de CCTV</b>", title_style))
-  story.append(Spacer(1, 15))
-  story.append(
-      Paragraph(
-          "Reporte generado automáticamente a través del sistema MXL Digital"
-          " Services / INJUL.",
-          normal_style,
-      )
-  )
 
   doc.build(story, canvasmaker=NumberedCanvas)
   return send_file(pdf_path, as_attachment=True)
