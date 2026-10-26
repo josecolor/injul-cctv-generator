@@ -2,6 +2,7 @@ import os
 from datetime import datetime
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+import psycopg2
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
@@ -45,7 +46,7 @@ class NumberedCanvas(canvas.Canvas):
 
     # 1. Marca de agua CONFIDENCIAL en diagonal
     self.setFont("Helvetica-Bold", 60)
-    self.setFillColor(colors.HexColor("#F2DEDE"), alpha=0.4)  # Rojo muy suave
+    self.setFillColor(colors.HexColor("#F2DEDE"), alpha=0.4)
     self.translate(300, 400)
     self.rotate(45)
     self.drawCentredString(0, 0, "CONFIDENCIAL")
@@ -65,7 +66,6 @@ class NumberedCanvas(canvas.Canvas):
     self.drawString(36, 25, footer_text_left)
     self.drawRightString(letter[0] - 36, 25, footer_text_right)
 
-    # Línea sutil sobre el pie de página
     self.setStrokeColor(colors.HexColor("#CCCCCC"))
     self.setLineWidth(0.5)
     self.line(36, 38, letter[0] - 36, 38)
@@ -73,10 +73,48 @@ class NumberedCanvas(canvas.Canvas):
     self.restoreState()
 
 
+def inicializar_base_de_datos():
+  """Crea las tablas automáticas ('cajas de información') en PostgreSQL si no
+
+  existen.
+  """
+  database_url = os.environ.get("DATABASE_URL")
+  if not database_url:
+    print(
+        "[-] ADVERTENCIA: No se encontró DATABASE_URL. Saltando conexión a BD."
+    )
+    return
+
+  try:
+    conn = psycopg2.connect(database_url)
+    cur = conn.cursor()
+
+    # Tabla para guardar el historial de reportes generados
+    cur.execute("""
+            CREATE TABLE IF NOT EXISTS reportes_cctv (
+                id SERIAL PRIMARY KEY,
+                fecha DATE NOT NULL,
+                total_camaras INT,
+                operativas INT,
+                no_visibles INT,
+                por_verificar INT,
+                disponibilidad VARCHAR(20),
+                creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
+    conn.commit()
+    cur.close()
+    conn.close()
+    print(
+        "[+] Base de datos conectada y tablas creadas/verificadas con éxito."
+    )
+  except Exception as e:
+    print(f"[-] Error al conectar o crear tablas en la base de datos: {e}")
+
+
 def generar_reporte_excel(output_excel_path):
-  """Genera el libro Excel matriz con las 11 pestañas sincronizadas."""
   wb = openpyxl.Workbook()
-  # Eliminar hoja por defecto
   default_sheet = wb.active
   wb.remove(default_sheet)
 
@@ -98,7 +136,6 @@ def generar_reporte_excel(output_excel_path):
     ws = wb.create_sheet(title=nombre)
     ws.views.sheetView[0].showGridLines = True
 
-    # Cabecera de prueba simulada
     ws["A1"] = f"INJUL - Consolidado de CCTV [{nombre}]"
     ws["A1"].font = Font(name="Helvetica", size=14, bold=True, color="1F497D")
 
@@ -125,10 +162,6 @@ def generar_reporte_excel(output_excel_path):
 
 
 def generar_reporte_pdf(output_pdf_path):
-  """Genera el PDF corporativo de 13 páginas estructurado exactamente al estándar de
-
-  INJUL.
-  """
   doc = SimpleDocTemplate(
       output_pdf_path,
       pagesize=letter,
@@ -139,18 +172,22 @@ def generar_reporte_pdf(output_pdf_path):
   )
 
   story = []
-  styles = getSampleStyleSheet() if "getSampleStyleSheet" in globals() else None
-  # Definición simple de estilos por si acaso
   from reportlab.lib.styles import ParagraphStyle
 
   title_style = ParagraphStyle(
-      "TitleStyle", fontName="Helvetica-Bold", fontSize=16, textColor=colors.HexColor("#1F497D")
+      "TitleStyle",
+      fontName="Helvetica-Bold",
+      fontSize=16,
+      textColor=colors.HexColor("#1F497D"),
   )
   normal_style = ParagraphStyle(
-      "NormalStyle", fontName="Helvetica", fontSize=10, textColor=colors.HexColor("#333333")
+      "NormalStyle",
+      fontName="Helvetica",
+      fontSize=10,
+      textColor=colors.HexColor("#333333"),
   )
 
-  # --- PÁGINA 1: PANEL DE CONTROL Y RESUMEN ---
+  # PÁGINA 1
   story.append(Paragraph("INJUL - Consolidado Maestro de CCTV", title_style))
   story.append(Spacer(1, 10))
   story.append(
@@ -162,7 +199,6 @@ def generar_reporte_pdf(output_pdf_path):
   )
   story.append(Spacer(1, 15))
 
-  # Tabla resumen KPIs globales
   kpi_data = [
       ["Cámaras Totales", "Operativas", "No Visibles", "Por Verificar", "Disponibilidad"],
       ["223", "121", "97", "5", "54.3%"],
@@ -182,7 +218,7 @@ def generar_reporte_pdf(output_pdf_path):
   story.append(t_kpi)
   story.append(PageBreak())
 
-  # --- PÁGINAS 2 A 10: SUCURSALES (Ejemplo estructurado dinámico) ---
+  # PÁGINAS 2 A 10 (Sucursales)
   sucursales = [
       "Caribbean Agregados",
       "Marmotech Blue Mall",
@@ -197,13 +233,9 @@ def generar_reporte_pdf(output_pdf_path):
 
   for idx, suc in enumerate(sucursales, start=1):
     story.append(
-        Paragraph(
-            f"<b>Sucursal {idx} de 9: {suc}</b>", title_style
-        )
+        Paragraph(f"<b>Sucursal {idx} de 9: {suc}</b>", title_style)
     )
     story.append(Spacer(1, 10))
-
-    # Tabla de cámaras de ejemplo para la sucursal
     branch_data = [
         ["#", "Ubicación / Nombre en EZStation", "En vivo", "Grabación", "Estado", "Observaciones"],
         ["1", "Entrada Principal", "Sí", "Normal", "Operativa", ""],
@@ -223,7 +255,7 @@ def generar_reporte_pdf(output_pdf_path):
     story.append(t_branch)
     story.append(PageBreak())
 
-  # --- PÁGINA 13: SEGUIMIENTO DE TICKETS ---
+  # PÁGINA 13: TICKETS
   story.append(Paragraph("Seguimiento Detallado de Tickets con el Proveedor", title_style))
   story.append(Spacer(1, 10))
   ticket_data = [
@@ -244,12 +276,14 @@ def generar_reporte_pdf(output_pdf_path):
   )
   story.append(t_tickets)
 
-  # Construir documento usando el canvas numerado con la marca de agua
   doc.build(story, canvasmaker=NumberedCanvas)
   print(f"[+] PDF corporativo guardado con éxito en: {output_pdf_path}")
 
 
 if __name__ == "__main__":
+  print("[*] Verificando e inicializando base de datos...")
+  inicializar_base_de_datos()
+
   fecha_hoy = datetime.now().strftime("%Y-%m-%d")
   pdf_nombre = f"Reporte_CCTV_INJUL_{fecha_hoy}.pdf"
   excel_nombre = f"Reporte_CCTV_INJUL_{fecha_hoy}.xlsx"
