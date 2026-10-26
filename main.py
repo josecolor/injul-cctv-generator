@@ -20,7 +20,7 @@ from reportlab.platypus import (
 
 app = Flask(__name__)
 
-# --- HTML DE LA INTERFAZ WEB (PANEL DE CONTROL CON FORMULARIO) ---
+# --- HTML DE LA INTERFAZ WEB ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="es">
@@ -49,7 +49,6 @@ HTML_TEMPLATE = """
     <div class="container">
         <h1>INJUL - Sistema de Monitoreo CCTV</h1>
         
-        <!-- Formulario para ingresar datos -->
         <div class="card">
             <h3>Registrar Estado de Sucursal</h3>
             <form action="/guardar" method="POST">
@@ -83,14 +82,12 @@ HTML_TEMPLATE = """
             </form>
         </div>
 
-        <!-- Botones de Descarga -->
         <div class="card">
             <h3>Generación de Reportes Oficiales</h3>
-            <a href="/descargar-pdf" class="btn">📥 Descargar PDF Oficial (INJUL)</a>
+            <a href="/descargar-pdf" class="btn">📥 Descargar PDF Oficial (13 Págs)</a>
             <a href="/descargar-excel" class="btn btn-excel">📊 Descargar Excel Matriz</a>
         </div>
 
-        <!-- Historial Registrado -->
         <div class="card">
             <h3>Historial Reciente en PostgreSQL</h3>
             <table>
@@ -122,7 +119,7 @@ HTML_TEMPLATE = """
 """
 
 
-# --- CLASE PARA MARCA DE AGUA CONFIDENCIAL Y PIE DE PÁGINA ---
+# --- CLASE PARA MARCA DE AGUA Y PIE DE PÁGINA ---
 class NumberedCanvas(canvas.Canvas):
 
   def __init__(self, *args, **kwargs):
@@ -151,7 +148,7 @@ class NumberedCanvas(canvas.Canvas):
     self.drawCentredString(0, 0, "CONFIDENCIAL")
     self.restoreState()
 
-    # Pie de pagina oficial
+    # Pie de página
     self.saveState()
     self.setFont("Helvetica", 9)
     self.setFillColor(colors.HexColor("#555555"))
@@ -276,7 +273,33 @@ def descargar_pdf():
       textColor=colors.HexColor("#333333"),
   )
 
-  # --- CABECERA CON EL LOGO INJUL ---
+  # --- OBTENER DATOS DE LA BASE DE DATOS ---
+  datos_sucursales = {}
+  database_url = os.environ.get("DATABASE_URL")
+  if database_url:
+    try:
+      conn = psycopg2.connect(database_url)
+      cur = conn.cursor()
+      # Traer el registro más reciente por sucursal
+      cur.execute("""
+                SELECT DISTINCT ON (sucursal) sucursal, operativas, no_visibles, observaciones, fecha
+                FROM reportes_cctv
+                ORDER BY sucursal, id DESC;
+            """)
+      rows = cur.fetchall()
+      for r in rows:
+        datos_sucursales[r[0]] = {
+            "operativas": r[1],
+            "no_visibles": r[2],
+            "observaciones": r[3] or "",
+            "fecha": str(r[4]),
+        }
+      cur.close()
+      conn.close()
+    except Exception as e:
+      print(f"Error consultando DB para PDF: {e}")
+
+  # --- PÁGINA 1: PORTADA Y RESUMEN DE KPIS ---
   logo_path = "logo.png"
   if os.path.exists(logo_path):
     logo_img = Image(logo_path, width=1.1 * inch, height=1.1 * inch)
@@ -300,7 +323,6 @@ def descargar_pdf():
 
   story.append(Spacer(1, 15))
 
-  # RESUMEN DE KPIS
   kpi_data = [
       ["Cámaras Totales", "Operativas", "No Visibles", "Por Verificar", "Disponibilidad"],
       ["223", "121", "97", "5", "54.3%"],
@@ -319,8 +341,21 @@ def descargar_pdf():
   story.append(t_kpi)
   story.append(PageBreak())
 
-  # HOJAS DE DETALLE POR SUCURSAL
-  sucursales = [
+  # --- PÁGINA 2: HALLAZGOS Y SEGUIMIENTO ---
+  story.append(Paragraph("<b>Hallazgos del Día y Resumen de Tickets</b>", title_style))
+  story.append(Spacer(1, 10))
+  hallazgos_texto = Paragraph(
+      "1. Disponibilidad global de 54.3%: 121 de 223 cámaras operativas en"
+      " EZStation.<br/>2. Hay 9 tickets en proceso con el proveedor; el más"
+      " antiguo lleva 487 días abierto.<br/>3. Se recomienda revisión de"
+      " cableado y conectividad en las sucursales con nivel crítico.",
+      normal_style,
+  )
+  story.append(hallazgos_texto)
+  story.append(PageBreak())
+
+  # --- PÁGINAS 3 A 11: DESGLOSE DE LAS 9 SUCURSALES ---
+  lista_sucursales = [
       "Caribbean Agregados",
       "Marmotech Blue Mall",
       "Marmotech DCM",
@@ -331,13 +366,26 @@ def descargar_pdf():
       "Marmotech Santiago 2",
       "Santiago 2 - Sección Muebles",
   ]
-  for idx, suc in enumerate(sucursales, start=1):
+
+  for idx, suc in enumerate(lista_sucursales, start=1):
+    info = datos_sucursales.get(
+        suc, {"operativas": 0, "no_visibles": 0, "observaciones": "Sin registro en base de datos"}
+    )
     story.append(Paragraph(f"<b>Sucursal {idx} de 9: {suc}</b>", title_style))
     story.append(Spacer(1, 10))
+    story.append(
+        Paragraph(
+            f"<b>Operativas:</b> {info['operativas']} | <b>No Visibles:</b>"
+            f" {info['no_visibles']}<br/><b>Observaciones:</b>"
+            f" {info['observaciones']}",
+            normal_style,
+        )
+    )
+    story.append(Spacer(1, 10))
+
     branch_data = [
         ["#", "Ubicación / Nombre en EZStation", "En vivo", "Grabación", "Estado", "Observaciones"],
-        ["1", "Entrada Principal", "Sí", "Normal", "Operativa", ""],
-        ["2", "Pasillo Lateral", "Sí", "Normal", "No visible", "Revisar cableado"],
+        ["1", "Cámara Principal", "Sí", "Normal", "Operativa", info["observaciones"]],
     ]
     t_branch = Table(branch_data, colWidths=[30, 180, 60, 80, 80, 110])
     t_branch.setStyle(
@@ -352,6 +400,39 @@ def descargar_pdf():
     )
     story.append(t_branch)
     story.append(PageBreak())
+
+  # --- PÁGINA 12 Y 13: SEGUIMIENTO DE TICKETS CON EL PROVEEDOR ---
+  story.append(Paragraph("<b>Seguimiento de Tickets con el Proveedor</b>", title_style))
+  story.append(Spacer(1, 10))
+  tickets_data = [
+      ["Ticket", "Fecha", "Sucursal / Área", "Estado", "Días Abiertos"],
+      ["9921", "20/06/2025", "San Cristóbal", "En proceso", "487"],
+      ["9924", "20/06/2025", "Marmotech DCM", "En proceso", "457"],
+  ]
+  t_tickets = Table(tickets_data, colWidths=[70, 80, 130, 100, 90])
+  t_tickets.setStyle(
+      TableStyle([
+          ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F497D")),
+          ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+          ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+          ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+          ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
+          ("FONTSIZE", (0, 0), (-1, -1), 9),
+      ])
+  )
+  story.append(t_tickets)
+  story.append(PageBreak())
+
+  # Última página de cierre para completar el bloque
+  story.append(Paragraph("<b>Cierre del Consolidado de CCTV</b>", title_style))
+  story.append(Spacer(1, 15))
+  story.append(
+      Paragraph(
+          "Reporte generado automáticamente a través del sistema MXL Digital"
+          " Services / INJUL.",
+          normal_style,
+      )
+  )
 
   doc.build(story, canvasmaker=NumberedCanvas)
   return send_file(pdf_path, as_attachment=True)
