@@ -27,7 +27,7 @@
             <div class="collapse navbar-collapse" id="navbarNav">
                 <ul class="navbar-nav ms-auto">
                     <li class="nav-item"><a class="nav-link active" href="/"><i class="fa-solid fa-house me-1"></i> Resumen</a></li>
-                    <li class="nav-item"><a class="nav-link" href="/ciclico"><init class="fa-solid fa-rotate me-1"></init> Monitoreo Cíclico</a></li>
+                    <li class="nav-item"><a class="nav-link" href="/ciclico"><i class="fa-solid fa-rotate me-1"></i> Monitoreo Cíclico</a></li>
                     <li class="nav-item"><a class="nav-link" href="/historial"><i class="fa-solid fa-clock-rotate-left me-1"></i> Historial</a></li>
                 </ul>
             </div>
@@ -72,13 +72,15 @@
             <div class="mb-3">
                 <label for="selectSucursal" class="form-label fw-bold">Sucursal:</label>
                 <select id="selectSucursal" class="form-select" onchange="cambiarSucursal(this.value)">
-                    {% for suc in catalogo.keys() %}
+                    {% set lista_sucursales = catalogo.keys()|list %}
+                    {% for suc in lista_sucursales %}
                         <option value="{{ loop.index0 }}" {% if seleccion == loop.index0 %}selected{% endif %}>{{ suc }}</option>
                     {% endfor %}
                 </select>
             </div>
 
-            {% set sucursal_actual = list(catalogo.keys())[seleccion] if seleccion < catalogo.keys()|list|length else catalogo.keys()|list|index(0) %}
+            {% set lista_sucursales = catalogo.keys()|list %}
+            {% set sucursal_actual = lista_sucursales[seleccion] if seleccion < lista_sucursales|length else lista_sucursales[0] %}
             
             <h5 class="mt-4 text-secondary">Cámaras de <span class="text-dark">{{ sucursal_actual }}</span></h5>
             
@@ -136,7 +138,6 @@
         }
 
         function guardarCamara(sucursal, idx, elemento) {
-            // Lógica asíncrona para guardar cambios sin recargar toda la página
             let fila = elemento.closest('tr');
             let inputs = fila.querySelectorAll('input, select');
             
@@ -155,7 +156,6 @@
                 body: JSON.stringify(datos)
             }).then(res => res.json()).then(res => {
                 if(res.ok) {
-                    // Actualiza clase visual del selector de estado
                     let selEstado = inputs[2];
                     selEstado.className = "form-select form-select-sm " + (selEstado.value === 'Operativa' ? 'estado-op' : (selEstado.value === 'No visible' ? 'estado-nv' : 'estado-pv'));
                 }
