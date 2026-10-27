@@ -14,7 +14,7 @@
         .btn-excel { background: #217346; }
         .btn-ticket { background: #D9534F; }
         .btn-gris { background: #6c757d; }
-        .btn:hover { opacity: 0.9; }
+        .btn-limpiar { background: #c9302c; color: white; border: none; padding: 5px 8px; border-radius: 3px; cursor: pointer; font-size: 12px; }
         .form-group { margin-bottom: 10px; }
         label { display: block; font-weight: bold; font-size: 13px; margin-bottom: 3px; color: #444; }
         input, select, textarea { width: 100%; padding: 6px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
@@ -24,7 +24,7 @@
         .estado-op td.celda-estado { background: #dff0d8; }
         .estado-nv td.celda-estado { background: #f2dede; }
         .estado-pv td.celda-estado { background: #fcf8e3; }
-        .marca { font-size: 11px; color: #777; white-space: nowrap; min-width: 70px; }
+        .marca { font-size: 11px; color: #777; white-space: nowrap; min-width: 60px; }
         .marca.ok { color: #2d6a2d; }
         .marca.error { color: #a94442; font-weight: bold; }
         .aviso { padding: 10px 14px; border-radius: 4px; margin-bottom: 15px; font-size: 14px; }
@@ -35,6 +35,7 @@
         .kpi b { display: block; font-size: 22px; color: #1F497D; }
         .kpi span { font-size: 11px; color: #666; }
         .tabla-scroll { overflow-x: auto; }
+        .obs-box { display: flex; gap: 4px; align-items: center; }
     </style>
     <script>
         var CLASES = {'Operativa': 'estado-op', 'No visible': 'estado-nv', 'Por verificar': 'estado-pv'};
@@ -53,6 +54,12 @@
             document.getElementById('k-nv').textContent = r.no_visibles;
             document.getElementById('k-pv').textContent = r.por_verificar;
             document.getElementById('k-disp').textContent = r.disponibilidad.toFixed(1) + '%';
+        }
+
+        function limpiarObservacion(btn) {
+            var tr = btn.closest('tr');
+            tr.querySelector('.input-obs').value = '';
+            guardarFila(tr);
         }
 
         function guardarFila(tr) {
@@ -86,7 +93,7 @@
                 actualizarResumen(res.j.resumen);
             }).catch(function () {
                 marca.className = 'marca error';
-                marca.textContent = 'NO guardado: reintenta';
+                marca.textContent = 'Error';
             });
         }
 
@@ -107,7 +114,7 @@
 <body>
     <div class="container">
         <h1>INJUL - Sistema de Monitoreo CCTV</h1>
-        <p style="margin: 0 0 12px;"><a class="btn btn-gris" href="/ciclico/">Plan de Monitoreo Cíclico y Novedades →</a></p>
+        <p style="margin: 0 0 12px;"><a class="btn btn-gris" href="/ciclico/">Plan de Monitoreo Cíclico →</a></p>
 
         {% if mensaje %}<div class="aviso {{ tipo }}">{{ mensaje }}</div>{% endif %}
 
@@ -121,9 +128,6 @@
 
         <div class="card">
             <h3>Seleccionar Sucursal y Revisar Cámaras</h3>
-            <p style="font-size: 12px; color: #666; margin-top: 0;">
-                Cada cambio de estado, en vivo, grabación u observación se guarda al instante.
-            </p>
             <div class="form-group">
                 <label>Sucursal:</label>
                 <select id="sucursal-select" onchange="mostrarSucursal()">
@@ -151,13 +155,14 @@
                     {% for cam in camaras %}
                     {% set info = guardado.get(cam, {}) %}
                     {% set est = info.get('estado') or 'Por verificar' %}
-                    {% set env = info.get('en_vivo') or 'Sí' %}
+                    {% set env = info.get('en_vivo') or '' %}
                     {% set grb = info.get('grabacion') or 'Normal' %}
                     <tr class="camera-row {{ clases[est] }}" data-suc="{{ suc }}" data-idx="{{ loop.index0 }}">
                         <td>{{ loop.index }}</td>
                         <td style="text-align: left; font-weight: bold;">{{ cam }}</td>
                         <td>
                             <select class="select-envivo" style="padding: 3px;">
+                                <option value="" {% if env == '' %}selected{% endif %}>— (Vacío)</option>
                                 <option value="Sí" {% if env == 'Sí' %}selected{% endif %}>Sí</option>
                                 <option value="No" {% if env == 'No' %}selected{% endif %}>No</option>
                                 <option value="Intermitente" {% if env == 'Intermitente' %}selected{% endif %}>Intermitente</option>
@@ -178,7 +183,10 @@
                             </select>
                         </td>
                         <td>
-                            <input type="text" class="input-obs" value="{{ info.get('observacion', '') }}" maxlength="500" placeholder="Detalle..." style="padding: 3px;">
+                            <div class="obs-box">
+                                <input type="text" class="input-obs" value="{{ info.get('observacion', '') }}" maxlength="500" placeholder="Detalle...">
+                                <button type="button" class="btn-limpiar" onclick="limpiarObservacion(this)" title="Borrar observación">🗑️</button>
+                            </div>
                         </td>
                         <td class="marca"></td>
                     </tr>
@@ -187,43 +195,6 @@
                 </div>
             </div>
             {% endfor %}
-        </div>
-
-        <div class="card">
-            <h3>Registrar Ticket o Novedad con Proveedor</h3>
-            <form action="/guardar-ticket" method="POST">
-                <div class="form-group">
-                    <label>Número de Ticket:</label>
-                    <input type="text" name="ticket" required maxlength="50" placeholder="Ej: 10437 o SIN TICKET">
-                </div>
-                <div class="form-group">
-                    <label>Sucursal o Área Afectada:</label>
-                    <input type="text" name="sucursal_area" required maxlength="150" placeholder="Ej: Marmotech DCM">
-                </div>
-                <div class="form-group">
-                    <label>Estado del Ticket:</label>
-                    <select name="estado_ticket">
-                        <option value="En proceso">En proceso</option>
-                        <option value="Terminado">Terminado</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label>Días Abiertos:</label>
-                    <input type="number" name="dias_abiertos" value="0" min="0" placeholder="Ej: 5">
-                </div>
-                <div class="form-group">
-                    <label>Detalle del Reporte:</label>
-                    <textarea name="detalle" rows="2" placeholder="Ej: Problemas de visualización..."></textarea>
-                </div>
-                <button type="submit" class="btn btn-ticket">📝 Registrar Ticket</button>
-            </form>
-        </div>
-
-        <div class="card">
-            <h3>Generación de Reportes Oficiales</h3>
-            <a href="/descargar-pdf" class="btn">📥 Descargar PDF Oficial</a>
-            <a href="/descargar-excel" class="btn btn-excel">📊 Descargar Excel Matriz</a>
-            <a href="/historial" class="btn btn-gris">🕘 Ver Historial de Cambios</a>
         </div>
     </div>
 </body>
