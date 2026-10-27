@@ -1,39 +1,40 @@
-"""INJUL - Plan de Monitoreo Cíclico y Novedades (módulo independiente).
+"""INJUL - Consolidado Maestro de CCTV.
 
-Es un Blueprint de Flask con sus propias tablas (prefijo ``ciclico_``), sus propias
-rutas (``/ciclico``) y su propia interfaz. No toca los reportes consolidados, el
-estado de cámaras ni los tickets del sistema principal: sólo LEE el catálogo
-oficial de cámaras (``CATALOGO_CAMARAS``) que le entrega ``main.py``.
-
-El catálogo que recibe es el CATÁLOGO CÍCLICO OFICIAL (la cuota de 5 a 10 cámaras
-clave por sede que un operador audita por turno), no el inventario completo.
-
-ROTACIÓN DIARIA: las cámaras del bloque NO son fijas. Cada fecha tiene su propio plan:
-el bloque avanza por el "pool" de la sede a partir del día ancla (el del PDF oficial) y
-el operador puede cambiar cualquier cuadro (buscando en el pool). El plan de una fecha
-se congela en ``ciclico_camaras`` al primer registro, así los días pasados no cambian.
-
-Todo se guarda en PostgreSQL al instante, vinculado por fecha, y cada cambio queda
-en ``ciclico_auditoria`` para no perder el rastro de nada.
+Flask + PostgreSQL (estado actual + historial trazable) + Redis (caché opcional).
+Cada cambio de estado u observación se guarda al instante y queda en el historial.
 """
 
+import json
 import logging
+import os
 import re
-from datetime import date, datetime, timedelta
+from contextlib import contextmanager
+from datetime import date, datetime
 from io import BytesIO
 from xml.sax.saxutils import escape
 
-from flask import Blueprint, Response, jsonify, render_template_string, request, send_file
-from openpyxl import Workbook
+import openpyxl
+import psycopg2
+import redis
+from flask import (
+    Flask,
+    jsonify,
+    redirect,
+    render_template_string,
+    request,
+    send_file,
+    url_for,
+)
 from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
+from reportlab.graphics.charts.barcharts import HorizontalBarChart
+from reportlab.graphics.shapes import Drawing, Rect, String
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER
-from reportlab.lib.pagesizes import A4
+from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.pdfgen import canvas
 from reportlab.platypus import (
-    Flowable,
-    KeepTogether,
+    Image,
     PageBreak,
     Paragraph,
     SimpleDocTemplate,
@@ -42,1290 +43,1200 @@ from reportlab.platypus import (
     TableStyle,
 )
 
-logger = logging.getLogger("injul-cctv.ciclico")
+try:
+    from zoneinfo import ZoneInfo
 
-bp = Blueprint("ciclico", __name__, url_prefix="/ciclico")
+    ZONA_HORARIA = ZoneInfo("America/Santo_Domingo")
+except Exception:  # noqa: BLE001 - si falta tzdata se usa UTC-4 fijo (RD no tiene horario de verano)
+    from datetime import timedelta, timezone
 
-# Dependencias inyectadas por registrar() (así este archivo no importa main.py).
-_cfg = {}
+    ZONA_HORARIA = timezone(timedelta(hours=-4), "AST")
 
-DIAS = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
-UBICACION_DEFECTO = "MARMOTECH - Red de Sucursales"
-AREA_DEFECTO = "Monitoreo / Sistema de Videovigilancia"
-RE_HORA = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("injul-cctv")
 
-# Campos editables del turno: nombre -> (tipo, longitud máxima)
-CAMPOS_TURNO = {
-    "dia_rotacion": ("txt", 40),
-    "desde": ("hora", 5),
-    "hasta": ("hora", 5),
-    "ubicacion_sistema": ("txt", 150),
-    "responsable": ("txt", 120),
-    "area": ("txt", 150),
-    "informe_novedades": ("txt", 10000),
-}
-MAX_NOVEDADES_SITIO = 4000
+app = Flask(__name__)
 
-# Cuota operativa mínima por sede y turno: un ciclo de 5 cámaras. Las sedes de 10
-# cuadros (San Cristóbal, DCM) tienen dos ciclos: 1-5 (parte superior) y 6-10 (inferior).
-CUOTA_MINIMA = 5
-CICLO = 5
+DATABASE_URL = os.environ.get("DATABASE_URL")
+REDIS_URL = os.environ.get("REDIS_URL")
+CACHE_KEY = "cctv:datos_reporte"
+CACHE_TTL = 300  # segundos (la caché también se invalida en cada escritura)
 
-# Filas del "RESUMEN INFORMATIVO DEL PROCESO" tal como aparecen en el PDF oficial:
-# (clave en el catálogo cíclico | None si no tiene bloque, rótulo oficial, total de cámaras).
-RESUMEN_OFICIAL = [
-    ("Sucursal San Cristóbal", "SAN CRISTÓBAL", "52"),
-    ("Marmotech DCM", "SANTO DOMINGO (DCM)", "51"),
-    ("Marmotech Santiago 1", "SANTIAGO 1", "16"),
-    ("Marmotech Santiago 2", "SANTIAGO 2", "16"),
-    ("Marmotech Blue Mall", "BLUE MALL", "16"),
-    ("Marmotech Outlet RP", "OUTLET RP", "16"),
-    ("Marmotech Punta Cana", "PUNTA CANA", "17"),
-    ("Marmotech Caribbean", "CARIBBEAN", "22"),
-    (None, "BOCA CHICA", ""),
-]
-TOTAL_SEDE = {clave: total for clave, _, total in RESUMEN_OFICIAL if clave}
-
-
-# ----------------------------------------------------------------------------
-# Base de datos
-# ----------------------------------------------------------------------------
-def crear_tablas(cur):
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS ciclico_turnos (
-            fecha DATE PRIMARY KEY,
-            dia_rotacion VARCHAR(40) NOT NULL DEFAULT '',
-            desde VARCHAR(5) NOT NULL DEFAULT '',
-            hasta VARCHAR(5) NOT NULL DEFAULT '',
-            ubicacion_sistema VARCHAR(150) NOT NULL DEFAULT '',
-            responsable VARCHAR(120) NOT NULL DEFAULT '',
-            area VARCHAR(150) NOT NULL DEFAULT '',
-            informe_novedades TEXT NOT NULL DEFAULT '',
-            creado_en TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            actualizado_en TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-        CREATE TABLE IF NOT EXISTS ciclico_sitios (
-            fecha DATE NOT NULL,
-            sucursal VARCHAR(100) NOT NULL,
-            hora_inicio VARCHAR(5) NOT NULL DEFAULT '',
-            hora_fin VARCHAR(5) NOT NULL DEFAULT '',
-            novedades TEXT NOT NULL DEFAULT '',
-            actualizado_en TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            PRIMARY KEY (fecha, sucursal)
-        );
-        CREATE TABLE IF NOT EXISTS ciclico_camaras (
-            fecha DATE NOT NULL,
-            sucursal VARCHAR(100) NOT NULL,
-            orden INT NOT NULL,
-            camara VARCHAR(150) NOT NULL,
-            revisada BOOLEAN NOT NULL DEFAULT FALSE,
-            hora_inicio VARCHAR(5) NOT NULL DEFAULT '',
-            hora_fin VARCHAR(5) NOT NULL DEFAULT '',
-            actualizado_en TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            PRIMARY KEY (fecha, sucursal, orden)
-        );
-        CREATE TABLE IF NOT EXISTS ciclico_auditoria (
-            id BIGSERIAL PRIMARY KEY,
-            cambiado_en TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            fecha DATE NOT NULL,
-            sucursal VARCHAR(100) NOT NULL DEFAULT '',
-            camara VARCHAR(150) NOT NULL DEFAULT '',
-            campo VARCHAR(40) NOT NULL,
-            valor_anterior TEXT,
-            valor_nuevo TEXT,
-            origen VARCHAR(60)
-        );
-        CREATE INDEX IF NOT EXISTS idx_ciclico_aud_fecha
-            ON ciclico_auditoria (fecha, cambiado_en DESC);
-    """)
-
-
-def _upsert(cur, tabla, pk, extra_insert, campos, camara_log=""):
-    """Crea la fila si no existe, compara y actualiza sólo lo que cambió.
-
-    Cada cambio se registra en ciclico_auditoria. Devuelve los valores finales.
-    ``tabla`` y los nombres de columnas vienen siempre de constantes del código.
-    """
-    cols = list(pk) + list(extra_insert)
-    cur.execute(
-        f"INSERT INTO {tabla} ({','.join(cols)}) VALUES ({','.join(['%s'] * len(cols))}) "
-        "ON CONFLICT DO NOTHING",
-        [*pk.values(), *extra_insert.values()],
-    )
-    if not campos:
-        return {}
-    donde = " AND ".join(f"{k}=%s" for k in pk)
-    nombres = list(campos)
-    cur.execute(
-        f"SELECT {','.join(nombres)} FROM {tabla} WHERE {donde} FOR UPDATE",
-        list(pk.values()),
-    )
-    actual = dict(zip(nombres, cur.fetchone()))
-    cambios = {n: v for n, v in campos.items() if actual[n] != v}
-    if cambios:
-        sets = ", ".join(f"{n}=%s" for n in cambios)
-        cur.execute(
-            f"UPDATE {tabla} SET {sets}, actualizado_en = NOW() WHERE {donde}",
-            [*cambios.values(), *pk.values()],
+# --- REDIS (CACHÉ OPCIONAL: si falla, la app sigue funcionando sin caché) ---
+cache = None
+if REDIS_URL:
+    try:
+        cache = redis.Redis.from_url(
+            REDIS_URL,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+            decode_responses=True,
         )
-        for n, nuevo in cambios.items():
-            cur.execute(
-                """
-                INSERT INTO ciclico_auditoria
-                    (fecha, sucursal, camara, campo, valor_anterior, valor_nuevo, origen)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    pk["fecha"], pk.get("sucursal", ""), camara_log, n,
-                    str(actual[n]), str(nuevo), _cfg["ip_cliente"](),
-                ),
-            )
-        actual.update(cambios)
-    return actual
+    except Exception:  # noqa: BLE001
+        logger.exception("No se pudo configurar Redis; se continúa sin caché")
+        cache = None
+
+# --- CATÁLOGO OFICIAL DE CÁMARAS POR SUCURSAL ---
+CATALOGO_CAMARAS = {
+    "Caribbean Agregados": [
+        "Frente Oficina", "Puerta desde CR", "Lado Atras", "IP Camera 04",
+        "Frente Lado desde Caribbean", "Lado Atras esquina puerta", "Puerta lado norte",
+        "Frente hacia lado norte", "Oficina Gabinete data", "IP Camera 10", "IP Camera 11",
+        "IP Camera 12", "IP Camera 13", "IP Camera 14", "IP Camera 15", "IP Camera 16",
+    ],
+    "Marmotech Blue Mall": [
+        "Show 2da planta", "Area Clientes 1ra planta", "Area 1ra planta puerta trasera",
+        "2da Planta banos", "Area 1ra planta puerta trasera (2)", "Gabinete TI",
+        "IP Camera 07", "2da Planta banos (2)", "IP Camera 09", "IP Camera 10",
+        "IP Camera 11", "IP Camera 12", "IP Camera 13", "IP Camera 14", "IP Camera 15",
+        "IP Camera 16",
+    ],
+    "Marmotech DCM": [
+        "Puerta Principal", "Cocina", "IP Camera 03", "S1 Entrada Vehiculos",
+        "S2 Pasillo lateral", "IP Camera 06", "1ra planta asensor visita", "IP Camera 09",
+        "IP Camera 11", "segundo nivel banera", "seg piso griferia", "IP Camera 14",
+        "IP Camera 15", "Entrada edificio", "S2 Salida", "IP Camera 18", "IP Camera 19",
+        "5to piso onix miel", "S2 Salida V", "S2 Salida Planta E", "Entrada Calle Parqueos",
+        "Frente Edificio", "Salida S1 Vehiculos", "S1 Entrada al S2",
+        "S1 Entrada vista de frente", "S2 Area Piezas y Vehiculos", "IP Camera 30",
+        "almacen griferia piiso 1", "piso 1 entrada plancha", "IP Camera 33",
+        "IP Camera 34", "IP Camera 35", "IP Camera 36", "IP Camera 37", "IP Camera 38",
+        "IP Camera 39", "IP Camera 40", "IP Camera 41", "IP Camera 42", "IP Camera 43",
+        "IP Camera 45", "Oficina Almacen", "Entrada a cobro lobby", "IP Camera 49",
+        "Salida Asensor c", "IP Camera 51", "IP Camera 52", "IP Camera 53", "IP Camera 54",
+        "IP Camera 55", "IP Camera 56",
+    ],
+    "Marmotech Outlet RP": [
+        "IP Camera 01", "IP Camera 02", "IP Camera 03", "IP Camera 04", "IP Camera 05",
+        "IP Camera 06", "IP Camera 07", "IP Camera 08", "IP Camera 09", "IP Camera 10",
+        "IP Camera 11", "IP Camera 12", "IP Camera 13", "IP Camera 14", "IP Camera 15",
+        "IP Camera 16",
+    ],
+    "Marmotech Punta Cana": [
+        "Puerta Entrada Principal", "Area trasera 1", "Area Trasera 2", "Area Trasera 5",
+        "Area trasera 3", "Area Trasera 4", "Oficina 1", "Area Gabinete datos", "Almacen",
+        "Area Lateral Derecha", "Zona Carga / Descarga", "Almacen 1", "Frente Edificacion",
+        "Instalacion", "Entrada Oficinas", "Almacen 2 Escalera Subir Techo Oficina",
+        "Almacen 3",
+    ],
+    "Sucursal San Cristóbal": [
+        "Almacen Repuesto", "Parqueo 1 Tienda", "Entrada Tienda S", "Parqueo 2 Tienda",
+        "Almacen 1 Tienda", "C/Entrada Tienda", "Almacen 2 Tienda", "Almacen 3 Tienda",
+        "Calle Entrada 2", "Oficina Tienda S", "Parqueo 3 Tiend", "Almacen 4 Tienda",
+        "Almacen 5 Tienda", "Area Caja Oficin", "MODULARES 1",
+        "Entrada Mantenimiento norte", "MODULARES Area F", "MODULARES 4", "Alm. Gene 04",
+        "Alm Gene 06", "Cuarto de Compresores", "Alm Gene 01", "Alm Gene 02", "MOTORES 2",
+        "ENTRADA P1", "Puerta Entrada", "ARTECH 02", "PRODUCCION 1", "ARTECH 01",
+        "Alm Gene 03", "PULIDORAS", "ARTECH03", "PULIDORA 02", "DATA CENTER 1",
+        "Carga Area 1 Alm", "Puerta Entrada A", "Area Motores Alm", "Carga 2 Alm Gene",
+        "Gasoil entrada /", "Area Parqueo 1 F", "Salida Fabrica A", "Gasoil Dispensad",
+        "Gasoil", "Parqueo Fabrica", "Puerta Entrada G", "Garita Guardian",
+        "Escritorio Garit", "Frente Puerta no", "Almacen Repuesto (2)", "Ing y Calidad",
+        "Alm Gene 07", "Area de Planta", "ARTECH 1", "ARTECH 2", "Alm Gene 05",
+        "IP Camera 57", "IP Camera 58", "IP Camera 59",
+    ],
+    "Marmotech Santiago 1": [
+        "Almacen Repuesto", "Parqueo 1 Tienda", "Entrada Tienda 5", "Parqueo 2 Tienda",
+        "Almacen 1 Tienda", "C/Entrada Tienda", "Almacen 2 Tienda", "Almacen 3 Tienda",
+        "Calle Entrada 2", "Oficina Tienda S", "Parqueo 3 Tiend", "Almacen 4 Tienda",
+        "Almacen 5 Tienda", "Area Caja Oficin", "MODULARES 1",
+        "Entrada Mantenimiento norte",
+    ],
+    "Marmotech Santiago 2": [
+        "IP Camera 01", "IP Camera 02", "IP Camera 03", "IP Camera 04", "IP Camera 05",
+        "IP Camera 06", "IP Camera 07", "IP Camera 08", "IP Camera 09", "IP Camera 10",
+        "IP Camera 11", "IP Camera 12", "IP Camera 13", "IP Camera 14", "IP Camera 15",
+        "IP Camera 16",
+    ],
+    "Santiago 2 - Sección Muebles": [
+        "MUEBLES", "ENTRADA", "COCINA", "GRIFERIA", "PARQUEO O-E", "BANOS", "PISOS",
+        "SALA REUNION", "PARQUEO E-O", "COUNTER", "MASETEROS", "IP Camera 12",
+        "IP Camera 13", "IP Camera 14", "IP Camera 15", "IP Camera 16",
+    ],
+}
+# --- CATÁLOGO OFICIAL DEL MONITOREO CÍCLICO (formato institucional INJUL) ---
+# Es la cuota operativa que un operador audita por turno (5 a 10 cámaras clave por
+# sede), NO el chequeo masivo de todas las cámaras (eso es CATALOGO_CAMARAS).
+# El orden y la cantidad de cuadros de cada sede replican el PDF oficial: las sedes
+# grandes (San Cristóbal y DCM) llevan 10 cuadros (ciclo 1 = arriba, ciclo 2 = abajo);
+# el resto lleva 5. No agregar cámaras de más: rompe el formato.
+CATALOGO_CICLICO = {
+    "Sucursal San Cristóbal": [
+        "Entrada puerta 1 - entrada p1", "Área de diseño artech - artech02",
+        "Área de diseño artech 2 - artech01", "Pulidoras", "Pulidora 02",
+        "Carga almacén general - carga área 1 alm", "Carga almacén general 2",
+        "Entrada a fábrica puerta 3 - salida fábrica A",
+        "Garita punchado - puerta entrada G", "Calle principal puerta 2 - frente puerta",
+    ],
+    "Marmotech DCM": [
+        "IP Camera 30", "Frente de la puerta, utensilios - IP Camera 32",
+        "Parqueo de motores - IP Camera 34", "Terraza lado céntrico - IP Camera 36",
+        "IP Camera 38", "Parqueo sótano 1 - IP Camera 40",
+        "Pasillos de exhibidores parte céntrica - IP Camera 42", "IP Camera 44",
+        "IP Camera 46", "IP Camera 48",
+    ],
+    "Marmotech Santiago 1": [
+        "Calle frente a la empresa - IP Camera 02", "Parte trasera - IP Camera 04",
+        "Calle principal - IP Camera 06", "Mostrador - IP Camera 08",
+        "Almacén interior 2 - IP Camera 10",
+    ],
+    "Marmotech Santiago 2": [
+        "Mostrador - Muebles", "Cocina", "Parqueo principal - Parqueo 0-E", "Pisos",
+        "Parqueo E-O",
+    ],
+    "Marmotech Blue Mall": [
+        "Show 2da Planta", "Área 1ra Planta Puerta Trasera",
+        "Área 1ra Planta Puerta Trasera Norte", "Área Clientes 1ra Planta", "Gabinete TI",
+    ],
+    "Marmotech Outlet RP": [
+        "Parqueo lado derecho - IP Camera 10", "Parte atrás, compresores A/C - IP Camera 12",
+        "Almacén General - IP Camera 14", "Exhibidores de venta - IP Camera 16",
+        "Cámara escalera lado izquierdo - IP Camera 02",
+    ],
+    "Marmotech Punta Cana": [
+        "Área Trasera 1", "Área Trasera 5", "Área Trasera 4", "Área Gabinete Datos",
+        "Puerta Entrada Principal",
+    ],
+    "Marmotech Caribbean": [
+        "CB 6-7-8 Planta Eléctrica", "Taller Soldar", "Oficina Almacén Repuesto",
+        "Almacén Repuesto", "Taller Fabricación",
+    ],
+    "Caribbean Agregados": [
+        "Frente Lado desde Caribbean", "Lado Atrás esquina puerta", "Puerta lado norte",
+        "Frente hacia lado norte", "Oficina Gabinete data",
+    ],
+}
+
+# --- ROTACIÓN DIARIA DEL MONITOREO CÍCLICO ---
+# CATALOGO_CICLICO es el bloque OFICIAL de referencia (PDF del 24/10/2026): define
+# cuántos cuadros lleva cada sede (10 ó 5) y es el punto de partida de la rotación.
+# Cada día el bloque avanza por el "pool" de la sede (bloque oficial + resto del
+# inventario) y el operador puede cambiar cualquier cuadro desde la pantalla.
+ANCLA_ROTACION = date(2026, 10, 24)  # día en que el bloque es exactamente el oficial
+
+# Sede cíclica -> sede del inventario completo (CATALOGO_CAMARAS) de donde salen las rotantes.
+INVENTARIO_DE = {
+    "Sucursal San Cristóbal": "Sucursal San Cristóbal",
+    "Marmotech DCM": "Marmotech DCM",
+    "Marmotech Santiago 1": "Marmotech Santiago 1",
+    "Marmotech Santiago 2": "Marmotech Santiago 2",
+    "Marmotech Blue Mall": "Marmotech Blue Mall",
+    "Marmotech Outlet RP": "Marmotech Outlet RP",
+    "Marmotech Punta Cana": "Marmotech Punta Cana",
+    "Caribbean Agregados": "Caribbean Agregados",
+}
 
 
-def _asegurar_turno(cur, fecha):
-    _upsert(
-        cur, "ciclico_turnos", {"fecha": fecha},
-        {
-            "dia_rotacion": DIAS[fecha.weekday()],
-            "ubicacion_sistema": UBICACION_DEFECTO,
-            "area": AREA_DEFECTO,
-        },
-        {},
-    )
+def _construir_pool(clave):
+    """Bloque oficial primero (orden oficial) + cámaras del inventario que no se repiten."""
+    base = list(CATALOGO_CICLICO[clave])
+    vistos = {n.lower() for n in base}
+    nums = {m for n in base for m in re.findall(r"ip camera\s*0*(\d+)", n.lower())}
+    extra = []
+    for n in CATALOGO_CAMARAS.get(INVENTARIO_DE.get(clave, ""), []):
+        ip = re.findall(r"ip camera\s*0*(\d+)$", n.lower())
+        if n.lower() in vistos or (ip and ip[0] in nums):
+            continue
+        vistos.add(n.lower())
+        extra.append(n)
+    return base + extra
 
 
-# ----------------------------------------------------------------------------
-# Lectura del estado de un día
-# ----------------------------------------------------------------------------
-def _leer_estado(cur, fecha):
-    catalogo = _cfg["catalogo"]
+POOL_CICLICO = {clave: _construir_pool(clave) for clave in CATALOGO_CICLICO}
+
+
+def camaras_no_visibles(cur, sucursal):
+    """Cámaras de una sede del inventario con estado actual 'No visible' (el módulo cíclico
+    las omite del plan; al volver a 'Operativa' se reincorporan solas)."""
     cur.execute(
-        """
-        SELECT dia_rotacion, desde, hasta, ubicacion_sistema, responsable, area,
-               informe_novedades
-        FROM ciclico_turnos WHERE fecha = %s
-        """,
-        (fecha,),
+        "SELECT camara FROM estado_camaras_actual WHERE sucursal = %s AND estado = 'No visible'",
+        (sucursal,),
     )
-    fila = cur.fetchone()
-    if fila:
-        turno = dict(zip(
-            ["dia_rotacion", "desde", "hasta", "ubicacion_sistema", "responsable",
-             "area", "informe_novedades"], fila))
-        turno["guardado"] = True
-    else:
-        turno = {
-            "dia_rotacion": DIAS[fecha.weekday()], "desde": "", "hasta": "",
-            "ubicacion_sistema": UBICACION_DEFECTO, "responsable": "",
-            "area": AREA_DEFECTO, "informe_novedades": "", "guardado": False,
+    return {fila[0] for fila in cur.fetchall()}
+
+ESTADOS = [
+    ("Operativa", "Operativa (Sí)"),
+    ("No visible", "No visible (Rojo)"),
+    ("Por verificar", "Por verificar"),
+]
+ESTADOS_VALIDOS = {valor for valor, _ in ESTADOS}
+
+MENSAJES = {
+    "ticket_ok": ("ok", "Ticket registrado correctamente."),
+    "sin_db": ("error", "La base de datos no está configurada (falta DATABASE_URL)."),
+    "error": ("error", "No se pudo guardar. Revisa los registros en Railway."),
+}
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>INJUL - Consolidado CCTV</title>
+    <style>
+        body { font-family: Arial, sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 15px; }
+        .container { max-width: 950px; margin: 0 auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+        h1 { color: #1F497D; font-size: 20px; border-bottom: 2px solid #1F497D; padding-bottom: 8px; }
+        h3 { color: #1F497D; margin-top: 5px; }
+        .card { background: #f8f9fa; padding: 15px; margin-bottom: 15px; border-radius: 6px; border-left: 4px solid #1F497D; }
+        .btn { display: inline-block; background: #1F497D; color: white; padding: 10px 15px; text-decoration: none; border-radius: 4px; font-weight: bold; margin-top: 5px; margin-right: 5px; border: none; cursor: pointer; font-size: 14px; }
+        .btn-excel { background: #217346; }
+        .btn-ticket { background: #D9534F; }
+        .btn-gris { background: #6c757d; }
+        .btn:hover { opacity: 0.9; }
+        .form-group { margin-bottom: 10px; }
+        label { display: block; font-weight: bold; font-size: 13px; margin-bottom: 3px; color: #444; }
+        input, select, textarea { width: 100%; padding: 8px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: center; font-size: 12px; }
+        th { background-color: #1F497D; color: white; }
+        .estado-op td.celda-estado { background: #dff0d8; }
+        .estado-nv td.celda-estado { background: #f2dede; }
+        .estado-pv td.celda-estado { background: #fcf8e3; }
+        .marca { font-size: 11px; color: #777; white-space: nowrap; min-width: 80px; }
+        .marca.ok { color: #2d6a2d; }
+        .marca.error { color: #a94442; font-weight: bold; }
+        .aviso { padding: 10px 14px; border-radius: 4px; margin-bottom: 15px; font-size: 14px; }
+        .aviso.ok { background: #dff0d8; color: #2d6a2d; }
+        .aviso.error { background: #f2dede; color: #a94442; }
+        .kpis { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 15px; }
+        .kpi { flex: 1; min-width: 110px; background: #f8f9fa; border-top: 3px solid #1F497D; padding: 8px; text-align: center; }
+        .kpi b { display: block; font-size: 22px; color: #1F497D; }
+        .kpi span { font-size: 11px; color: #666; }
+        .tabla-scroll { overflow-x: auto; }
+    </style>
+    <script>
+        var CLASES = {'Operativa': 'estado-op', 'No visible': 'estado-nv', 'Por verificar': 'estado-pv'};
+
+        function mostrarSucursal() {
+            var select = document.getElementById('sucursal-select');
+            var listas = document.getElementsByClassName('lista-sucursal');
+            for (var i = 0; i < listas.length; i++) {
+                listas[i].style.display = (listas[i].id === 'sucursal-' + select.selectedIndex) ? 'block' : 'none';
+            }
         }
 
-    cur.execute(
-        "SELECT sucursal, hora_inicio, hora_fin, novedades FROM ciclico_sitios WHERE fecha = %s",
-        (fecha,),
-    )
-    sitios_db = {r[0]: r[1:] for r in cur.fetchall()}
-    cur.execute(
-        """
-        SELECT sucursal, orden, camara, revisada, hora_inicio, hora_fin
-        FROM ciclico_camaras WHERE fecha = %s
-        """,
-        (fecha,),
-    )
-    camaras_db = {(r[0], r[1]): r[2:] for r in cur.fetchall()}
+        function actualizarResumen(r) {
+            document.getElementById('k-total').textContent = r.total;
+            document.getElementById('k-op').textContent = r.operativas;
+            document.getElementById('k-nv').textContent = r.no_visibles;
+            document.getElementById('k-pv').textContent = r.por_verificar;
+            document.getElementById('k-disp').textContent = r.disponibilidad.toFixed(1) + '%';
+        }
 
-    sitios = []
-    for suc in catalogo:
-        nombres = _plan_del_dia(fecha, suc, cur)
-        pool = _pool_de(suc)
-        pool_total = len(pool)
-        ini, fin, nov = sitios_db.get(suc, ("", "", ""))
-        camaras = []
-        for i, nombre in enumerate(nombres):
-            g = camaras_db.get((suc, i))
-            camaras.append({
-                "idx": i,
-                # Si ya se guardó, se muestra el nombre tal como se revisó ese día.
-                "nombre": g[0] if g else nombre,
-                "revisada": bool(g[1]) if g else False,
-                "hora_inicio": g[2] if g else "",
-                "hora_fin": g[3] if g else "",
-            })
-        revisadas = sum(1 for c in camaras if c["revisada"])
-        cuota = min(CUOTA_MINIMA, len(nombres))
-        sitios.append({
-            "sucursal": suc,
-            "total": len(nombres),                 # cuadros del bloque oficial
-            "total_sede": TOTAL_SEDE.get(suc, ""),  # total de cámaras de la sede (resumen)
-            "pool_total": pool_total,
-            "pool_desde": (pool.index(nombres[0]) + 1) if nombres and nombres[0] in pool else 1,
-            "rota": pool_total > len(nombres),
-            "cuota": cuota,
-            "cuota_cumplida": cuota > 0 and revisadas >= cuota,
-            "revisadas": revisadas,
-            "hora_inicio": ini,
-            "hora_fin": fin,
-            "novedades": nov,
-            "camaras": camaras,
-        })
-    return {"fecha": fecha.isoformat(), "turno": turno, "sitios": sitios}
+        function guardarFila(tr) {
+            var marca = tr.querySelector('.marca');
+            var estado = tr.querySelector('select').value;
+            var obs = tr.querySelector('input').value;
+            marca.className = 'marca';
+            marca.textContent = 'Guardando...';
+            fetch('/api/camara', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({sucursal: tr.dataset.suc, idx: parseInt(tr.dataset.idx, 10), estado: estado, observacion: obs})
+            }).then(function (resp) {
+                return resp.json().then(function (j) { return {ok: resp.ok, j: j}; });
+            }).then(function (res) {
+                if (!res.ok || !res.j.ok) { throw new Error(res.j.error || 'Error'); }
+                tr.className = 'camera-row ' + (CLASES[estado] || 'estado-pv');
+                marca.className = 'marca ok';
+                marca.textContent = res.j.cambiado ? 'Guardado \u2713' : 'Sin cambios';
+                actualizarResumen(res.j.resumen);
+            }).catch(function () {
+                marca.className = 'marca error';
+                marca.textContent = 'NO guardado: reintenta';
+            });
+        }
 
+        window.onload = function () {
+            mostrarSucursal();
+            var filas = document.querySelectorAll('tr.camera-row');
+            for (var i = 0; i < filas.length; i++) {
+                (function (tr) {
+                    tr.querySelector('select').addEventListener('change', function () { guardarFila(tr); });
+                    tr.querySelector('input').addEventListener('change', function () { guardarFila(tr); });
+                })(filas[i]);
+            }
+        };
+    </script>
+</head>
+<body>
+    <div class="container">
+        <h1>INJUL - Sistema de Monitoreo CCTV</h1>
+        <p style="margin: 0 0 12px;"><a class="btn btn-gris" href="/ciclico/">Plan de Monitoreo Cíclico y Novedades →</a></p>
 
-def _estado_sitio(cur, fecha, sucursal):
-    return next(s for s in _leer_estado(cur, fecha)["sitios"] if s["sucursal"] == sucursal)
+        {% if mensaje %}<div class="aviso {{ tipo }}">{{ mensaje }}</div>{% endif %}
 
+        <div class="kpis">
+            <div class="kpi"><b id="k-total">{{ resumen.total }}</b><span>Cámaras</span></div>
+            <div class="kpi"><b id="k-op">{{ resumen.operativas }}</b><span>Operativas</span></div>
+            <div class="kpi"><b id="k-nv">{{ resumen.no_visibles }}</b><span>No visibles</span></div>
+            <div class="kpi"><b id="k-pv">{{ resumen.por_verificar }}</b><span>Por verificar</span></div>
+            <div class="kpi"><b id="k-disp">{{ '%.1f'|format(resumen.disponibilidad) }}%</b><span>Disponibilidad</span></div>
+        </div>
 
-# ----------------------------------------------------------------------------
-# Rotación diaria: plan de cámaras de cada fecha
-# ----------------------------------------------------------------------------
-VENTANA_DIAS = 6  # una cámara usada no se reasigna en los 6 días siguientes (misma sede)
+        <div class="card">
+            <h3>Seleccionar Sucursal y Revisar Cámaras</h3>
+            <p style="font-size: 12px; color: #666; margin-top: 0;">
+                Cada cambio de estado u observación se guarda al instante y queda registrado en el historial.
+            </p>
+            <div class="form-group">
+                <label>Sucursal:</label>
+                <select id="sucursal-select" onchange="mostrarSucursal()">
+                    {% for suc in catalogo.keys() %}
+                    <option value="{{ suc }}" {% if loop.index0 == seleccion %}selected{% endif %}>{{ suc }}</option>
+                    {% endfor %}
+                </select>
+            </div>
 
+            {% for suc, camaras in catalogo.items() %}
+            {% set guardado = detalles.get(suc, {}) %}
+            <div id="sucursal-{{ loop.index0 }}" class="lista-sucursal" style="display:none; margin-top: 15px;">
+                <h4 style="color: #1F497D; margin-bottom: 5px;">Cámaras de {{ suc }}</h4>
+                <div class="tabla-scroll">
+                <table>
+                    <tr>
+                        <th>#</th>
+                        <th>Nombre de la Cámara (EZStation)</th>
+                        <th>Estado</th>
+                        <th>Observación</th>
+                        <th></th>
+                    </tr>
+                    {% for cam in camaras %}
+                    {% set info = guardado.get(cam, {}) %}
+                    {% set est = info.get('estado') or 'Por verificar' %}
+                    <tr class="camera-row {{ clases[est] }}" data-suc="{{ suc }}" data-idx="{{ loop.index0 }}">
+                        <td>{{ loop.index }}</td>
+                        <td style="text-align: left; font-weight: bold;">{{ cam }}</td>
+                        <td class="celda-estado">
+                            <select style="padding: 4px;">
+                                {% for valor, texto in estados %}
+                                <option value="{{ valor }}" {% if est == valor %}selected{% endif %}>{{ texto }}</option>
+                                {% endfor %}
+                            </select>
+                        </td>
+                        <td>
+                            <input type="text" value="{{ info.get('observacion', '') }}" maxlength="500" placeholder="Detalle si falla..." style="padding: 4px;">
+                        </td>
+                        <td class="marca"></td>
+                    </tr>
+                    {% endfor %}
+                </table>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
 
-def _claves(nombre):
-    """Claves de comparación de una cámara: su nombre y, si lo trae, su 'IP Camera NN'.
+        <div class="card">
+            <h3>Registrar Ticket o Novedad con Proveedor</h3>
+            <form action="/guardar-ticket" method="POST">
+                <div class="form-group">
+                    <label>Número de Ticket:</label>
+                    <input type="text" name="ticket" required maxlength="50" placeholder="Ej: 10437 o SIN TICKET">
+                </div>
+                <div class="form-group">
+                    <label>Sucursal o Área Afectada:</label>
+                    <input type="text" name="sucursal_area" required maxlength="150" placeholder="Ej: Marmotech DCM">
+                </div>
+                <div class="form-group">
+                    <label>Estado del Ticket:</label>
+                    <select name="estado_ticket">
+                        <option value="En proceso">En proceso</option>
+                        <option value="Terminado">Terminado</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Días Abiertos:</label>
+                    <input type="number" name="dias_abiertos" value="0" min="0" placeholder="Ej: 5">
+                </div>
+                <div class="form-group">
+                    <label>Detalle del Reporte (Información de lo que pasó):</label>
+                    <textarea name="detalle" rows="2" placeholder="Ej: Problemas de visualización..."></textarea>
+                </div>
+                <button type="submit" class="btn btn-ticket">📝 Registrar Ticket</button>
+            </form>
+        </div>
 
-    Los nombres oficiales del bloque ("Parqueo de motores - IP Camera 34") se cruzan con
-    el inventario del consolidado ("IP Camera 34") por ese número.
-    """
-    n = " ".join(str(nombre).lower().split())
-    claves = {n}
-    claves.update("ip:" + m for m in re.findall(r"ip camera\s*0*(\d+)", n))
-    return claves
+        <div class="card">
+            <h3>Generación de Reportes Oficiales</h3>
+            <a href="/descargar-pdf" class="btn">📥 Descargar PDF Oficial</a>
+            <a href="/descargar-excel" class="btn btn-excel">📊 Descargar Excel Matriz</a>
+            <a href="/historial" class="btn btn-gris">🕘 Ver Historial de Cambios</a>
+        </div>
+    </div>
+</body>
+</html>
+"""
 
-
-def _segura(cur, fn):
-    """Ejecuta consultas de apoyo dentro de un SAVEPOINT: si fallan no abortan la transacción."""
-    try:
-        cur.execute("SAVEPOINT sp_ciclico_plan")
-        resultado = fn()
-        cur.execute("RELEASE SAVEPOINT sp_ciclico_plan")
-        return resultado
-    except Exception:  # noqa: BLE001
-        logger.exception("Consulta de apoyo del plan cíclico falló; se usa el plan sin ese dato")
-        try:
-            cur.execute("ROLLBACK TO SAVEPOINT sp_ciclico_plan")
-        except Exception:  # noqa: BLE001
-            pass
-        return None
-
-
-def _pool_de(suc):
-    return _cfg["pool"].get(suc) or _cfg["catalogo"][suc]
-
-
-def _no_visibles_de_pool(cur, suc):
-    """Cámaras del pool de la sede marcadas 'No visible' en el consolidado (estado actual).
-
-    Se lee en vivo en cada cálculo: al repararse y pasar a 'Operativa' vuelven solas.
-    """
-    leer = _cfg.get("no_visibles")
-    inventario = (_cfg.get("inventario_de") or {}).get(suc)
-    if not leer or not inventario:
-        return set()
-    malas = _segura(cur, lambda: leer(cur, inventario)) or set()
-    claves = set()
-    for nombre in malas:
-        claves |= _claves(nombre)
-    return {c for c in _pool_de(suc) if _claves(c) & claves}
-
-
-def _plan_basico(fecha, suc):
-    """Rotación pura por fecha (sin base de datos): n cuadros consecutivos del pool."""
-    base = _cfg["catalogo"][suc]
-    n = len(base)
-    pool = _pool_de(suc)
-    if len(pool) <= n:
-        return list(base)
-    off = ((fecha - _cfg["ancla"]).days * n) % len(pool)
-    return [pool[(off + i) % len(pool)] for i in range(n)]
-
-
-def _elegir_bloque(pool, n, usadas, malas, previo):
-    """Elige exactamente n cámaras del pool.
-
-    1) Sólo cámaras NO usadas en la ventana y NO dañadas, continuando donde terminó el
-       bloque anterior (se recorre el pool por bloques sin repetir).
-    2) Si no alcanzan (pool agotado) se inicia un nuevo ciclo: se completa con las usadas
-       hace más tiempo.
-    3) Último recurso, con demasiadas cámaras dañadas: se completa con dañadas.
-    """
-    inicio = 0
-    if previo and previo[-1] in pool:
-        inicio = (pool.index(previo[-1]) + 1) % len(pool)
-    orden = pool[inicio:] + pool[:inicio]
-    libres = [c for c in orden if c.lower() not in usadas and c not in malas]
-    if len(libres) >= n:
-        return libres[:n]
-    elegidas = list(libres)
-    reutilizables = sorted(
-        (c for c in orden if c.lower() in usadas and c not in malas),
-        key=lambda c: usadas[c.lower()],  # las usadas hace más tiempo primero (orden estable)
-    )
-    elegidas += reutilizables[: n - len(elegidas)]
-    if len(elegidas) < n:
-        logger.warning("Sede %s: pocas cámaras operativas para completar el bloque", pool[:1])
-        elegidas += [c for c in orden if c in malas][: n - len(elegidas)]
-    return elegidas
-
-
-def _plan_del_dia(fecha, suc, cur=None):
-    """Cámaras que tocan en ``fecha`` para la sede ``suc`` (siempre la cuota exacta: 5 ó 10).
-
-    * No repite cámaras usadas en los 6 días previos (lee ``ciclico_camaras``).
-    * Omite las 'No visible' del consolidado (``estado_camaras_actual``) y reincorpora
-      las que vuelven a 'Operativa'.
-    * Los días previos aún sin guardar se simulan con la misma regla, así la rotación es
-      continua aunque el operador no haya abierto esos días. El día ancla es el bloque oficial.
-    Con ``cur=None`` abre su propia conexión; si no hay base de datos usa la rotación pura.
-    """
-    n = len(_cfg["catalogo"][suc])
-    try:
-        if not _cfg["database_url"]:
-            return _plan_basico(fecha, suc)
-        if cur is None:
-            with _cfg["db_cursor"]() as propio:
-                plan = _plan_rotado(propio, fecha, suc)
-        else:
-            plan = _plan_rotado(cur, fecha, suc)
-        if len(plan) == n:
-            return plan
-        logger.error("Plan cíclico con %s cuadros (se esperaban %s); se usa rotación pura", len(plan), n)
-    except Exception:  # noqa: BLE001
-        logger.exception("No se pudo calcular el plan cíclico desde la base de datos")
-    return _plan_basico(fecha, suc)
-
-
-def _plan_rotado(cur, fecha, suc):
-    n = len(_cfg["catalogo"][suc])
-    pool = _pool_de(suc)
-    if len(pool) < n:
-        return list(_cfg["catalogo"][suc])
-    desde = fecha - timedelta(days=2 * VENTANA_DIAS)
-    filas = _segura(cur, lambda: (
-        cur.execute(
-            "SELECT fecha, orden, camara FROM ciclico_camaras "
-            "WHERE sucursal=%s AND fecha >= %s AND fecha < %s ORDER BY fecha, orden",
-            (suc, desde, fecha),
-        ) or cur.fetchall()
-    ))
-    historial = {}  # fecha -> [cámaras del bloque] de los días ya guardados
-    for f, _orden, camara in filas or []:
-        historial.setdefault(f, []).append(camara)
-    malas = _no_visibles_de_pool(cur, suc)
-    ancla = _cfg["ancla"]
-
-    def bloque(dia):
-        if dia in historial:
-            return historial[dia]
-        previo = historial.get(dia - timedelta(days=1))
-        usadas = {}
-        for k in range(VENTANA_DIAS, 0, -1):  # del más antiguo al más reciente
-            for c in historial.get(dia - timedelta(days=k), []):
-                usadas[c.lower()] = dia - timedelta(days=k)
-        if dia == ancla:
-            usadas, previo = {}, None  # el día ancla arranca el pool: bloque oficial
-        return _elegir_bloque(pool, n, usadas, malas, previo)
-
-    # Días previos de la ventana que aún no se guardaron: se simulan en orden.
-    for k in range(VENTANA_DIAS, 0, -1):
-        dia = fecha - timedelta(days=k)
-        if dia not in historial and dia >= ancla:
-            historial[dia] = bloque(dia)
-    return bloque(fecha)
-
-
-def _congelar_plan(cur, fecha, suc):
-    """Guarda el plan del día para que no cambie aunque el pool o la rotación cambien."""
-    _upsert(cur, "ciclico_sitios", {"fecha": fecha, "sucursal": suc}, {}, {})
-    for i, nombre in enumerate(_plan_del_dia(fecha, suc, cur)):
-        cur.execute(
-            "INSERT INTO ciclico_camaras (fecha, sucursal, orden, camara) VALUES (%s,%s,%s,%s) "
-            "ON CONFLICT DO NOTHING",
-            (fecha, suc, i, nombre),
-        )
-
-
-def _nombres_vigentes(cur, fecha, suc):
-    """Nombres del plan del día (lo guardado manda sobre el cálculo)."""
-    nombres = _plan_del_dia(fecha, suc, cur)
-    cur.execute("SELECT orden, camara FROM ciclico_camaras WHERE fecha=%s AND sucursal=%s", (fecha, suc))
-    for orden, camara in cur.fetchall():
-        if 0 <= orden < len(nombres):
-            nombres[orden] = camara
-    return nombres
+HISTORIAL_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>INJUL - Historial CCTV</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #f4f6f9; color: #333; margin: 0; padding: 15px; }
+        .container { max-width: 1100px; margin: 0 auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+        h1 { color: #1F497D; font-size: 20px; border-bottom: 2px solid #1F497D; padding-bottom: 8px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th, td { border: 1px solid #ddd; padding: 6px; font-size: 12px; text-align: left; }
+        th { background: #1F497D; color: #fff; }
+        select, .btn { padding: 8px; font-size: 14px; }
+        .btn { background: #1F497D; color: #fff; text-decoration: none; border-radius: 4px; }
+        .tabla-scroll { overflow-x: auto; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Historial de cambios (últimos {{ filas|length }})</h1>
+        <form method="GET" action="/historial">
+            <select name="sucursal" onchange="this.form.submit()">
+                <option value="">Todas las sucursales</option>
+                {% for suc in catalogo.keys() %}
+                <option value="{{ suc }}" {% if suc == filtro %}selected{% endif %}>{{ suc }}</option>
+                {% endfor %}
+            </select>
+            <a class="btn" href="/">← Volver al panel</a>
+        </form>
+        <div class="tabla-scroll">
+        <table>
+            <tr><th>Fecha y hora</th><th>Sucursal</th><th>Cámara</th><th>Estado anterior</th><th>Estado nuevo</th><th>Observación anterior</th><th>Observación nueva</th><th>Origen</th></tr>
+            {% for f in filas %}
+            <tr>{% for campo in f %}<td>{{ campo }}</td>{% endfor %}</tr>
+            {% else %}
+            <tr><td colspan="8">Aún no hay cambios registrados.</td></tr>
+            {% endfor %}
+        </table>
+        </div>
+    </div>
+</body>
+</html>
+"""
 
 
 # ----------------------------------------------------------------------------
-# Validaciones
+# Utilidades
 # ----------------------------------------------------------------------------
-def _fecha_de(texto):
-    try:
-        return datetime.strptime(str(texto), "%Y-%m-%d").date()
-    except ValueError:
-        return None
-
-
-def _hora_valida(valor, ahora_hhmm):
-    """'now' -> hora actual del servidor (Santo Domingo); '' -> vacío; si no, HH:MM."""
-    if valor == "now":
-        return ahora_hhmm
-    valor = str(valor or "").strip()
-    if valor == "" or RE_HORA.match(valor):
-        return valor
-    raise ValueError("Hora no válida (use HH:MM)")
-
-
-def _sin_db():
-    if not _cfg["database_url"]:
-        return jsonify(ok=False, error="Base de datos no configurada"), 503
-    return None
-
-
-# ----------------------------------------------------------------------------
-# API
-# ----------------------------------------------------------------------------
-@bp.route("/api/estado")
-def api_estado():
-    err = _sin_db()
-    if err:
-        return err
-    fecha = _fecha_de(request.args.get("fecha")) or _cfg["ahora"]().date()
-    try:
-        with _cfg["db_cursor"]() as cur:
-            estado = _leer_estado(cur, fecha)
-    except Exception:  # noqa: BLE001
-        logger.exception("Error leyendo turno cíclico")
-        return jsonify(ok=False, error="No se pudo leer"), 500
-    estado["ahora"] = _cfg["ahora"]().strftime("%H:%M")
-    return jsonify(ok=True, **estado)
-
-
-@bp.route("/api/turno", methods=["POST"])
-def api_turno():
-    err = _sin_db()
-    if err:
-        return err
-    datos = request.get_json(silent=True) or {}
-    fecha = _fecha_de(datos.get("fecha"))
-    if not fecha:
-        return jsonify(ok=False, error="Fecha no válida"), 400
-    ahora_hhmm = _cfg["ahora"]().strftime("%H:%M")
-    campos = {}
-    try:
-        for nombre, (tipo, maximo) in CAMPOS_TURNO.items():
-            if nombre not in datos:
-                continue
-            if tipo == "hora":
-                campos[nombre] = _hora_valida(datos[nombre], ahora_hhmm)
-            else:
-                campos[nombre] = str(datos[nombre] or "").strip()[:maximo]
-    except ValueError as exc:
-        return jsonify(ok=False, error=str(exc)), 400
-    try:
-        with _cfg["db_cursor"]() as cur:
-            _asegurar_turno(cur, fecha)
-            final = _upsert(cur, "ciclico_turnos", {"fecha": fecha}, {}, campos)
-    except Exception:  # noqa: BLE001
-        logger.exception("Error guardando turno cíclico")
-        return jsonify(ok=False, error="No se pudo guardar"), 500
-    return jsonify(ok=True, turno=final)
-
-
-@bp.route("/api/sitio", methods=["POST"])
-def api_sitio():
-    err = _sin_db()
-    if err:
-        return err
-    datos = request.get_json(silent=True) or {}
-    fecha = _fecha_de(datos.get("fecha"))
-    sucursal = datos.get("sucursal")
-    if not fecha:
-        return jsonify(ok=False, error="Fecha no válida"), 400
-    if sucursal not in _cfg["catalogo"]:
-        return jsonify(ok=False, error="Sucursal no válida"), 400
-    ahora_hhmm = _cfg["ahora"]().strftime("%H:%M")
-    campos = {}
-    try:
-        for nombre in ("hora_inicio", "hora_fin"):
-            if nombre in datos:
-                campos[nombre] = _hora_valida(datos[nombre], ahora_hhmm)
-    except ValueError as exc:
-        return jsonify(ok=False, error=str(exc)), 400
-    if "novedades" in datos:
-        campos["novedades"] = str(datos["novedades"] or "").strip()[:MAX_NOVEDADES_SITIO]
-    try:
-        with _cfg["db_cursor"]() as cur:
-            _asegurar_turno(cur, fecha)
-            _upsert(cur, "ciclico_sitios", {"fecha": fecha, "sucursal": sucursal}, {}, campos)
-            sitio = _estado_sitio(cur, fecha, sucursal)
-    except Exception:  # noqa: BLE001
-        logger.exception("Error guardando sucursal cíclica")
-        return jsonify(ok=False, error="No se pudo guardar"), 500
-    return jsonify(ok=True, sitio=sitio)
-
-
-@bp.route("/api/camara", methods=["POST"])
-def api_camara():
-    err = _sin_db()
-    if err:
-        return err
-    datos = request.get_json(silent=True) or {}
-    fecha = _fecha_de(datos.get("fecha"))
-    sucursal = datos.get("sucursal")
-    idx = datos.get("idx")
-    if not fecha:
-        return jsonify(ok=False, error="Fecha no válida"), 400
-    if sucursal not in _cfg["catalogo"]:
-        return jsonify(ok=False, error="Sucursal no válida"), 400
-    nombres = _cfg["catalogo"][sucursal]  # sólo para validar el cuadro (la cuota no cambia)
-    if not isinstance(idx, int) or isinstance(idx, bool) or not 0 <= idx < len(nombres):
-        return jsonify(ok=False, error="Cámara no válida"), 400
-    ahora_hhmm = _cfg["ahora"]().strftime("%H:%M")
-
-    try:
-        with _cfg["db_cursor"]() as cur:
-            _asegurar_turno(cur, fecha)
-            pk_sitio = {"fecha": fecha, "sucursal": sucursal}
-            _congelar_plan(cur, fecha, sucursal)
-            camara = _nombres_vigentes(cur, fecha, sucursal)[idx]
-            pk = {"fecha": fecha, "sucursal": sucursal, "orden": idx}
-            _upsert(cur, "ciclico_camaras", pk, {"camara": camara}, {})
-            cur.execute(
-                """
-                SELECT camara, revisada, hora_inicio, hora_fin FROM ciclico_camaras
-                WHERE fecha=%s AND sucursal=%s AND orden=%s
-                """,
-                (fecha, sucursal, idx),
-            )
-            nombre_dia, rev_act, ini_act, fin_act = cur.fetchone()
-            ini, fin, rev = ini_act, fin_act, rev_act
-
-            if "hora_inicio" in datos:
-                ini = _hora_valida(datos["hora_inicio"], ahora_hhmm)
-            if "hora_fin" in datos:
-                fin = _hora_valida(datos["hora_fin"], ahora_hhmm)
-            if "revisada" in datos:
-                rev = bool(datos["revisada"])
-                if rev and not rev_act:
-                    # Al marcar: la hora fin es "ahora" (salvo que se haya dado una).
-                    if "hora_fin" not in datos:
-                        fin = ahora_hhmm
-                    # Si no tiene inicio, arranca donde terminó la cámara anterior
-                    # de la misma sucursal (o al iniciar la sucursal, o ahora).
-                    if not ini and "hora_inicio" not in datos:
-                        cur.execute(
-                            """
-                            SELECT MAX(hora_fin) FROM ciclico_camaras
-                            WHERE fecha=%s AND sucursal=%s AND revisada
-                              AND hora_fin <> '' AND orden <> %s
-                            """,
-                            (fecha, sucursal, idx),
-                        )
-                        previa = cur.fetchone()[0]
-                        cur.execute(
-                            "SELECT hora_inicio FROM ciclico_sitios WHERE fecha=%s AND sucursal=%s",
-                            (fecha, sucursal),
-                        )
-                        ini_sitio = cur.fetchone()[0]
-                        ini = previa or ini_sitio or fin
-                        if ini > fin:
-                            ini = fin
-                elif not rev and rev_act and "hora_fin" not in datos:
-                    fin = ""  # al desmarcar se limpia la hora fin (queda en auditoría)
-
-            _upsert(
-                cur, "ciclico_camaras", pk, {"camara": camara},
-                {"revisada": rev, "hora_inicio": ini, "hora_fin": fin},
-                camara_log=nombre_dia,
-            )
-
-            # Hora de la sucursal: inicia con la primera cámara marcada y termina
-            # cuando todas están marcadas (si el operador no las puso a mano).
-            cur.execute(
-                "SELECT COUNT(*) FILTER (WHERE revisada) FROM ciclico_camaras "
-                "WHERE fecha=%s AND sucursal=%s",
-                (fecha, sucursal),
-            )
-            marcadas = cur.fetchone()[0]
-            cur.execute(
-                "SELECT hora_inicio, hora_fin FROM ciclico_sitios WHERE fecha=%s AND sucursal=%s",
-                (fecha, sucursal),
-            )
-            s_ini, s_fin = cur.fetchone()
-            auto = {}
-            if rev and not s_ini and ini:
-                auto["hora_inicio"] = ini
-            # El cuadro FIN de la sede se cierra al cumplir la cuota (ciclo 1) y se
-            # corre hacia adelante si se completa el ciclo 2 (parte inferior).
-            if rev and not rev_act and marcadas >= min(CUOTA_MINIMA, len(nombres)) and fin \
-                    and (not s_fin or fin > s_fin):
-                auto["hora_fin"] = fin
-            if auto:
-                _upsert(cur, "ciclico_sitios", pk_sitio, {}, auto)
-            sitio = _estado_sitio(cur, fecha, sucursal)
-    except ValueError as exc:
-        return jsonify(ok=False, error=str(exc)), 400
-    except Exception:  # noqa: BLE001
-        logger.exception("Error guardando cámara cíclica")
-        return jsonify(ok=False, error="No se pudo guardar"), 500
-    return jsonify(ok=True, sitio=sitio)
-
-
-@bp.route("/api/pool")
-def api_pool():
-    """Busca en el pool de la sede (para cambiar una cámara del bloque del día)."""
-    err = _sin_db()
-    if err:
-        return err
-    fecha = _fecha_de(request.args.get("fecha")) or _cfg["ahora"]().date()
-    sucursal = request.args.get("sucursal")
-    if sucursal not in _cfg["catalogo"]:
-        return jsonify(ok=False, error="Sucursal no válida"), 400
-    palabras = request.args.get("q", "").lower().split()
-    try:
-        with _cfg["db_cursor"]() as cur:
-            en_plan = {n.lower() for n in _nombres_vigentes(cur, fecha, sucursal)}
-            malas = _no_visibles_de_pool(cur, sucursal)
-    except Exception:  # noqa: BLE001
-        logger.exception("Error leyendo pool cíclico")
-        return jsonify(ok=False, error="No se pudo leer"), 500
-    pool = _cfg["pool"].get(sucursal) or _cfg["catalogo"][sucursal]
-    items = [{"nombre": n, "en_plan": n.lower() in en_plan, "no_visible": n in malas}
-             for n in pool if all(p in n.lower() for p in palabras)]
-    return jsonify(ok=True, total=len(items), items=items[:80])
-
-
-@bp.route("/api/plan", methods=["POST"])
-def api_plan():
-    """Cambia la cámara de un cuadro del bloque de esa fecha (sólo si aún no se revisó)."""
-    err = _sin_db()
-    if err:
-        return err
-    datos = request.get_json(silent=True) or {}
-    fecha = _fecha_de(datos.get("fecha"))
-    sucursal = datos.get("sucursal")
-    idx = datos.get("idx")
-    nuevo = " ".join(str(datos.get("camara") or "").split())[:150]
-    if not fecha:
-        return jsonify(ok=False, error="Fecha no válida"), 400
-    if sucursal not in _cfg["catalogo"]:
-        return jsonify(ok=False, error="Sucursal no válida"), 400
-    n = len(_cfg["catalogo"][sucursal])
-    if not isinstance(idx, int) or isinstance(idx, bool) or not 0 <= idx < n:
-        return jsonify(ok=False, error="Cuadro no válido"), 400
-    if not nuevo:
-        return jsonify(ok=False, error="Indica el nombre de la cámara"), 400
-    try:
-        with _cfg["db_cursor"]() as cur:
-            _asegurar_turno(cur, fecha)
-            _congelar_plan(cur, fecha, sucursal)
-            actuales = _nombres_vigentes(cur, fecha, sucursal)
-            cur.execute(
-                "SELECT revisada FROM ciclico_camaras WHERE fecha=%s AND sucursal=%s AND orden=%s FOR UPDATE",
-                (fecha, sucursal, idx),
-            )
-            if cur.fetchone()[0]:
-                return jsonify(ok=False, error="Esa cámara ya está revisada: desmárcala antes de cambiarla"), 409
-            if any(i != idx and a.lower() == nuevo.lower() for i, a in enumerate(actuales)):
-                return jsonify(ok=False, error="Esa cámara ya está en el bloque del día"), 409
-            _upsert(cur, "ciclico_camaras", {"fecha": fecha, "sucursal": sucursal, "orden": idx},
-                    {"camara": nuevo}, {"camara": nuevo}, camara_log=actuales[idx])
-            sitio = _estado_sitio(cur, fecha, sucursal)
-    except Exception:  # noqa: BLE001
-        logger.exception("Error cambiando cámara del plan cíclico")
-        return jsonify(ok=False, error="No se pudo guardar"), 500
-    return jsonify(ok=True, sitio=sitio)
-
-
-@bp.route("/api/plan/restablecer", methods=["POST"])
-def api_plan_restablecer():
-    """Devuelve los cuadros aún no revisados a la rotación automática de esa fecha."""
-    err = _sin_db()
-    if err:
-        return err
-    datos = request.get_json(silent=True) or {}
-    fecha = _fecha_de(datos.get("fecha"))
-    sucursal = datos.get("sucursal")
-    if not fecha:
-        return jsonify(ok=False, error="Fecha no válida"), 400
-    if sucursal not in _cfg["catalogo"]:
-        return jsonify(ok=False, error="Sucursal no válida"), 400
-    try:
-        with _cfg["db_cursor"]() as cur:
-            _asegurar_turno(cur, fecha)
-            _congelar_plan(cur, fecha, sucursal)
-            actuales = _nombres_vigentes(cur, fecha, sucursal)
-            cur.execute("SELECT orden FROM ciclico_camaras WHERE fecha=%s AND sucursal=%s AND revisada",
-                        (fecha, sucursal))
-            bloqueados = {r[0] for r in cur.fetchall()}
-            usados = {actuales[i].lower() for i in bloqueados}
-            for i, auto in enumerate(_plan_del_dia(fecha, sucursal, cur)):
-                if i in bloqueados or actuales[i] == auto or auto.lower() in usados:
-                    continue
-                _upsert(cur, "ciclico_camaras", {"fecha": fecha, "sucursal": sucursal, "orden": i},
-                        {"camara": auto}, {"camara": auto}, camara_log=actuales[i])
-                usados.add(auto.lower())
-            sitio = _estado_sitio(cur, fecha, sucursal)
-    except Exception:  # noqa: BLE001
-        logger.exception("Error restableciendo plan cíclico")
-        return jsonify(ok=False, error="No se pudo guardar"), 500
-    return jsonify(ok=True, sitio=sitio)
-
-
-# ----------------------------------------------------------------------------
-# Páginas
-# ----------------------------------------------------------------------------
-@bp.route("/")
-def pagina():
-    fecha = _fecha_de(request.args.get("fecha")) or _cfg["ahora"]().date()
-    return render_template_string(PAGINA, fecha=fecha.isoformat())
-
-
-@bp.route("/historial")
-def historial():
-    filas = []
-    error = None
-    if not _cfg["database_url"]:
-        error = "La base de datos no está configurada (falta DATABASE_URL)."
-    else:
-        try:
-            with _cfg["db_cursor"]() as cur:
-                cur.execute("""
-                    SELECT t.fecha, t.dia_rotacion, t.responsable, t.desde, t.hasta,
-                           (SELECT COUNT(*) FROM ciclico_camaras c
-                             WHERE c.fecha = t.fecha AND c.revisada),
-                           (SELECT COUNT(*) FROM ciclico_sitios s
-                             WHERE s.fecha = t.fecha AND s.novedades <> ''),
-                           (t.informe_novedades <> '')
-                    FROM ciclico_turnos t ORDER BY t.fecha DESC LIMIT 120
-                """)
-                filas = cur.fetchall()
-        except Exception:  # noqa: BLE001
-            logger.exception("Error leyendo historial cíclico")
-            error = "No se pudo leer el historial."
-    total = sum(len(v) for v in _cfg["catalogo"].values())
-    return render_template_string(HISTORIAL, filas=filas, total=total, error=error)
-
-
-@bp.route("/auditoria")
-def auditoria():
-    fecha = _fecha_de(request.args.get("fecha")) or _cfg["ahora"]().date()
-    filas = []
-    error = None
-    if not _cfg["database_url"]:
-        error = "La base de datos no está configurada (falta DATABASE_URL)."
-    else:
-        try:
-            with _cfg["db_cursor"]() as cur:
-                cur.execute(
-                    """
-                    SELECT cambiado_en, sucursal, camara, campo, valor_anterior,
-                           valor_nuevo, origen
-                    FROM ciclico_auditoria WHERE fecha = %s
-                    ORDER BY cambiado_en DESC, id DESC LIMIT 1000
-                    """,
-                    (fecha,),
-                )
-                filas = [
-                    (_cfg["local_txt"](r[0]),) + tuple(r[1:]) for r in cur.fetchall()
-                ]
-        except Exception:  # noqa: BLE001
-            logger.exception("Error leyendo auditoría cíclica")
-            error = "No se pudo leer la auditoría."
-    return render_template_string(AUDITORIA, filas=filas, fecha=fecha.isoformat(), error=error)
-
-
-# ----------------------------------------------------------------------------
-# Descargas: PDF y Excel del turno (sólo lectura de las tablas ciclico_*)
-# ----------------------------------------------------------------------------
-def _txt(valor):
-    """Escapa texto para Paragraph de ReportLab."""
-    return escape(str(valor if valor is not None else ""))
-
-
-def _fecha_larga(iso):
-    return "/".join(reversed(iso.split("-")))
-
-
-def _estado_para_reporte(fecha):
-    """Lee el día completo y la hora del último cambio (para 'Hora del informe')."""
-    with _cfg["db_cursor"]() as cur:
-        estado = _leer_estado(cur, fecha)
-        cur.execute("SELECT MAX(cambiado_en) FROM ciclico_auditoria WHERE fecha = %s", (fecha,))
-        ultimo = cur.fetchone()[0]
-    if ultimo is not None:
-        # local_txt -> "dd/mm/aaaa hh:mm:ss AM"; se toma "hh:mm AM"
-        partes = _cfg["local_txt"](ultimo).split(" ")
-        estado["hora_informe"] = f"{partes[1][:5]} {partes[2]}"
-    else:
-        estado["hora_informe"] = _cfg["ahora"]().strftime("%I:%M %p")
-    return estado
-
-
-# --- Formato oficial INJUL (réplica del PDF institucional "Plan de Monitoreo
-# Tiempo Real Cíclico Diario"). No modernizar: colores, orden de secciones,
-# rótulos y estructura de bloques son normativos. ---------------------------
-NAVY = colors.HexColor("#0C3B66")
-VERDE = colors.HexColor("#2E7D32")
-ROJO = colors.HexColor("#EA4335")
-VERDE_CHECK = colors.HexColor("#08E608")
-VERDE_SN = colors.HexColor("#00C800")
-BORDE = colors.HexColor("#DADADA")
-CAJA = colors.HexColor("#F5F5F5")
-FILA_ALT = colors.HexColor("#F7F9F9")
-GRIS_ETQ = colors.HexColor("#666666")
-CUADRO_VACIO = colors.HexColor("#E0E0E0")
-
-A4_W, A4_H = A4
-MARGEN_X = 63
-ANCHO = A4_W - 2 * MARGEN_X  # ancho útil (≈ ancho del banner oficial)
-
-# Nombre con el que cada bloque del catálogo cíclico aparece en el formato oficial.
-# El orden de este diccionario es el orden oficial de los bloques en el PDF.
-NOMBRES_OFICIALES = {
-    "Sucursal San Cristóbal": "SAN CRISTÓBAL",
-    "Marmotech DCM": "SANTO DOMINGO (DCM)",
-    "Marmotech Santiago 1": "SANTIAGO 1",
-    "Marmotech Santiago 2": "SANTIAGO 2",
-    "Marmotech Blue Mall": "BLUE MALL",
-    "Marmotech Outlet RP": "OUTLET RP",
-    "Marmotech Punta Cana": "PUNTA CANA",
-    "Marmotech Caribbean": "CARIBBEAN",
-    "Caribbean Agregados": "CARIBBEAN agregado",
+CLASES_ESTADO = {
+    "Operativa": "estado-op",
+    "No visible": "estado-nv",
+    "Por verificar": "estado-pv",
 }
-ORDEN_OFICIAL = {k: i for i, k in enumerate(NOMBRES_OFICIALES)}
-# Páginas del PDF oficial: 1 = datos + resumen + San Cristóbal; 2 = DCM, Santiago 1,
-# Santiago 2 y Blue Mall; 3 = Outlet RP, Punta Cana, Caribbean, informe y firma;
-# 4 = Caribbean agregado (se añadió después de la firma).
-SALTO_ANTES_DE = {"Marmotech DCM", "Marmotech Outlet RP"}
-AGREGADO_TRAS_FIRMA = "Caribbean Agregados"
 
 
-def _nombre_oficial(sucursal):
-    return NOMBRES_OFICIALES.get(sucursal, sucursal.upper())
+def ahora():
+    return datetime.now(ZONA_HORARIA) if ZONA_HORARIA else datetime.now()
 
 
-def _ps(nombre, **kw):
-    base = dict(fontName="Helvetica", fontSize=8, leading=10, textColor=colors.HexColor("#222222"))
-    base.update(kw)
-    return ParagraphStyle(nombre, **base)
-
-
-E_TITULO = _ps("titulo", fontName="Helvetica-Bold", fontSize=12.5, leading=16, textColor=colors.white, alignment=TA_CENTER)
-E_SUB = _ps("sub", fontSize=8.5, leading=11, textColor=colors.white, alignment=TA_CENTER)
-E_ETQ = _ps("etq", fontName="Helvetica-Bold", fontSize=7, leading=9, textColor=GRIS_ETQ)
-E_VAL = _ps("val", fontName="Helvetica-Bold", fontSize=8.5, leading=10)
-E_BARRA = _ps("barra", fontName="Helvetica-Bold", fontSize=7.5, leading=9, textColor=colors.white)
-E_TH = _ps("th", fontName="Helvetica-Bold", fontSize=6.8, leading=8, textColor=colors.white)
-E_FILA = _ps("fila", fontSize=8, leading=10, textColor=colors.HexColor("#333333"))
-E_SITIO = _ps("sitio", fontName="Helvetica-Bold", fontSize=10, leading=12, textColor=NAVY)
-E_COL = _ps("col", fontName="Helvetica-Bold", fontSize=9, leading=11, textColor=NAVY, alignment=TA_CENTER)
-E_CAM = _ps("cam", fontSize=7, leading=8.5, textColor=NAVY)
-E_HORA = _ps("hora", fontName="Helvetica-Bold", fontSize=8, leading=9.5, alignment=TA_CENTER)
-E_NOV_ETQ = _ps("novetq", fontSize=8, leading=10)
-E_NOV = _ps("nov", fontSize=8.5, leading=11)
-E_INF_T = _ps("inft", fontName="Helvetica-Bold", fontSize=8.5, leading=11, alignment=TA_CENTER)
-E_INF = _ps("inf", fontName="Helvetica-Bold", fontSize=7, leading=9, alignment=TA_CENTER)
-E_PIE = _ps("pie", fontName="Helvetica-Oblique", fontSize=7.5, leading=9, textColor=colors.HexColor("#888888"), alignment=TA_CENTER)
-
-
-class Cuadro(Flowable):
-    """Cuadro de estado (verde = ok, rojo = novedad, gris = pendiente)."""
-
-    def __init__(self, color, lado=12):
-        super().__init__()
-        self.color, self.lado = color, lado
-
-    def wrap(self, aw, ah):
-        return self.lado, self.lado
-
-    def draw(self):
-        c = self.canv
-        c.setFillColor(self.color)
-        c.setStrokeColor(self.color)
-        c.rect(0, 0, self.lado, self.lado, stroke=0, fill=1)
-
-
-class Casilla(Flowable):
-    """Casilla de verificación; marcada = visto verde como en el formato oficial."""
-
-    def __init__(self, marcada):
-        super().__init__()
-        self.marcada = marcada
-
-    def wrap(self, aw, ah):
-        return 12, 12
-
-    def draw(self):
-        c = self.canv
-        c.setStrokeColor(colors.HexColor("#9E9E9E"))
-        c.setFillColor(colors.white)
-        c.setLineWidth(0.8)
-        c.rect(0.5, 0.5, 10, 10, stroke=1, fill=1)
-        if self.marcada:
-            _visto(c, 0, 0, 1.0, 1.8)
-
-
-def _visto(c, x, y, escala, grosor):
-    c.saveState()
-    c.setStrokeColor(VERDE_CHECK)
-    c.setLineWidth(grosor)
-    c.setLineCap(1)
-    c.setLineJoin(1)
-    p = c.beginPath()
-    p.moveTo(x + 1 * escala, y + 5 * escala)
-    p.lineTo(x + 4.5 * escala, y + 1 * escala)
-    p.lineTo(x + 12 * escala, y + 13 * escala)
-    c.drawPath(p, stroke=1, fill=0)
-    c.restoreState()
-
-
-def _icono_camara(c, x, y):
-    """Cámara de vigilancia (icono verde del resumen)."""
-    c.saveState()
-    c.translate(x, y)
-    c.setFillColor(VERDE)
-    c.setStrokeColor(VERDE)
-    c.rotate(-12)
-    c.roundRect(2, 5, 13, 7.5, 2, stroke=0, fill=1)   # cuerpo
-    c.roundRect(14, 6.5, 3.5, 4.5, 1, stroke=0, fill=1)  # lente
-    c.setFillColor(colors.white)
-    c.circle(6, 8.7, 1.5, stroke=0, fill=1)
-    c.setFillColor(VERDE)
-    c.setLineWidth(1.6)
-    c.line(5, 5, 3, 1)                                  # soporte
-    c.rect(0.5, 0, 5, 1.6, stroke=0, fill=1)
-    c.restoreState()
-
-
-class EstadoMonitoreo(Flowable):
-    """Columna 'CÁMARAS MONITOREADAS HOY' del resumen."""
-
-    def __init__(self, completo, revisadas, total, novedad):
-        super().__init__()
-        self.completo, self.revisadas, self.total, self.novedad = completo, revisadas, total, novedad
-
-    def wrap(self, aw, ah):
-        return 118, 17
-
-    def draw(self):
-        c = self.canv
-        if self.completo:
-            _icono_camara(c, 8, 2)
-            _visto(c, 36, 1, 1.0, 1.8)
-        elif self.revisadas:
-            c.setFont("Helvetica", 7.5)
-            c.setFillColor(GRIS_ETQ)
-            c.drawString(8, 5, f"{self.revisadas} / {self.total}")
-        if self.novedad:
-            c.setFillColor(ROJO)
-            c.rect(62, 3, 11, 11, stroke=0, fill=1)
-            c.setFont("Helvetica", 6.8)
-            c.drawString(77, 6, "novedad")
-
-
-def _hora12(hhmm):
-    if not hhmm:
-        return "—"
-    hh, mm = hhmm.split(":")
-    n = int(hh)
-    return f"{n % 12 or 12:02d}:{mm}{'AM' if n < 12 else 'PM'}"
-
-
-def _turno_nombre(desde):
-    if not desde:
+def local_txt(momento):
+    """Formatea un datetime de la base de datos en hora de Santo Domingo."""
+    if momento is None:
         return ""
-    h = int(desde.split(":")[0])
-    return " – TURNO DE LA MAÑANA" if h < 12 else (" – TURNO DE LA TARDE" if h < 18 else " – TURNO DE LA NOCHE")
+    if ZONA_HORARIA and momento.tzinfo:
+        momento = momento.astimezone(ZONA_HORARIA)
+    return momento.strftime("%d/%m/%Y %I:%M:%S %p")
 
 
-def _caja_redonda(contenido, ancho, alto=None, relleno=None, borde=BORDE, pad_izq=10):
-    t = Table([[contenido]], colWidths=[ancho], rowHeights=[alto] if alto else None)
-    estilo = [
-        ("BOX", (0, 0), (-1, -1), 0.8, borde), ("ROUNDEDCORNERS", [3, 3, 3, 3]),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("LEFTPADDING", (0, 0), (-1, -1), pad_izq),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 8), ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-    ]
-    if relleno is not None:
-        estilo.append(("BACKGROUND", (0, 0), (-1, -1), relleno))
-    t.setStyle(TableStyle(estilo))
-    return t
+def esc(texto):
+    """Escapa texto para usarlo dentro de un Paragraph de ReportLab."""
+    return escape(str(texto if texto is not None else ""))
 
 
-def _campo(etiqueta, valor, ancho):
-    t = Table(
-        [[Paragraph(etiqueta, E_ETQ)], [_caja_redonda(Paragraph(_txt(valor) or "&nbsp;", E_VAL), ancho, 21)]],
-        colWidths=[ancho],
-    )
-    t.setStyle(TableStyle([
-        ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ("TOPPADDING", (0, 0), (-1, -1), 1), ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-    ]))
-    return t
+def ip_cliente():
+    reenviado = request.headers.get("X-Forwarded-For", "")
+    return (reenviado.split(",")[0].strip() or request.remote_addr or "")[:60]
 
 
-def _trozos(texto, largo=450):
-    """Parte un texto largo en pedazos para que la tabla pueda saltar de página."""
-    salida = []
-    for linea in str(texto or "").splitlines() or [""]:
-        while len(linea) > largo:
-            corte = linea.rfind(" ", 0, largo)
-            corte = corte if corte > largo // 2 else largo
-            salida.append(linea[:corte])
-            linea = linea[corte:].lstrip()
-        salida.append(linea)
-    return salida
+@contextmanager
+def db_cursor():
+    """Abre conexión a Postgres; confirma al salir bien y revierte si hay error."""
+    conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                yield cur
+    finally:
+        conn.close()
 
 
-def _bloque_sitio(s):
-    """Bloque oficial de una sede: nombre + INICIO/FIN, cuadros de cámaras fijos con sus
-    horas, y 'Novedades y acciones tomadas'.
+def inicializar_base_de_datos():
+    if not DATABASE_URL:
+        logger.warning("DATABASE_URL no está definida; no se guardarán datos")
+        return
+    try:
+        with db_cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS reportes_cctv_detalles (
+                    id SERIAL PRIMARY KEY,
+                    fecha DATE NOT NULL,
+                    sucursal VARCHAR(100) NOT NULL,
+                    camara VARCHAR(150) NOT NULL,
+                    estado VARCHAR(50) NOT NULL,
+                    observacion TEXT
+                );
+                CREATE TABLE IF NOT EXISTS reportes_tickets (
+                    id SERIAL PRIMARY KEY,
+                    fecha DATE NOT NULL,
+                    ticket VARCHAR(50) NOT NULL,
+                    sucursal_area VARCHAR(150) NOT NULL,
+                    estado VARCHAR(50) NOT NULL,
+                    dias_abiertos INT DEFAULT 0,
+                    detalle TEXT,
+                    creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS estado_camaras_actual (
+                    sucursal VARCHAR(100) NOT NULL,
+                    camara VARCHAR(150) NOT NULL,
+                    estado VARCHAR(50) NOT NULL,
+                    observacion TEXT NOT NULL DEFAULT '',
+                    actualizado_en TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (sucursal, camara)
+                );
+                CREATE TABLE IF NOT EXISTS historial_cctv (
+                    id BIGSERIAL PRIMARY KEY,
+                    cambiado_en TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    sucursal VARCHAR(100) NOT NULL,
+                    camara VARCHAR(150) NOT NULL,
+                    estado_anterior VARCHAR(50),
+                    estado_nuevo VARCHAR(50) NOT NULL,
+                    observacion_anterior TEXT,
+                    observacion_nueva TEXT,
+                    origen VARCHAR(60)
+                );
+                CREATE INDEX IF NOT EXISTS idx_historial_fecha
+                    ON historial_cctv (cambiado_en DESC);
+                CREATE INDEX IF NOT EXISTS idx_historial_camara
+                    ON historial_cctv (sucursal, camara);
+            """)
+            # Migración única: si el estado actual está vacío, parte del último
+            # reporte diario guardado con la versión anterior de la app.
+            cur.execute("""
+                INSERT INTO estado_camaras_actual (sucursal, camara, estado, observacion)
+                SELECT sucursal, camara, estado, COALESCE(observacion, '')
+                FROM reportes_cctv_detalles
+                WHERE fecha = (SELECT MAX(fecha) FROM reportes_cctv_detalles)
+                  AND NOT EXISTS (SELECT 1 FROM estado_camaras_actual)
+                ON CONFLICT (sucursal, camara) DO NOTHING
+            """)
+    except Exception:  # noqa: BLE001
+        logger.exception("Error inicializando la base de datos")
 
-    Las filas son SIEMPRE las del catálogo oficial (5 o 10 cuadros): la hora de cada
-    cámara se estampa en su propia fila, así el ciclo 1 queda en la parte superior y el
-    ciclo 2 (cámaras 6-10 de las sedes grandes) en la parte inferior.
+
+# ----------------------------------------------------------------------------
+# Caché (Redis) y carga de datos
+# ----------------------------------------------------------------------------
+def cache_leer():
+    if cache is None:
+        return None
+    try:
+        crudo = cache.get(CACHE_KEY)
+        return json.loads(crudo) if crudo else None
+    except Exception:  # noqa: BLE001
+        logger.warning("Redis no disponible al leer; se consulta la base de datos")
+        return None
+
+
+def cache_guardar(datos):
+    if cache is None:
+        return
+    try:
+        cache.setex(CACHE_KEY, CACHE_TTL, json.dumps(datos))
+    except Exception:  # noqa: BLE001
+        logger.warning("Redis no disponible al guardar caché")
+
+
+def cache_invalidar():
+    if cache is None:
+        return
+    try:
+        cache.delete(CACHE_KEY)
+    except Exception:  # noqa: BLE001
+        logger.warning("Redis no disponible al invalidar caché")
+
+
+def cargar_datos():
+    """Devuelve {'detalles': {sucursal: {camara: {...}}}, 'tickets': [[...]], 'actualizado': str}."""
+    datos = cache_leer()
+    if datos is not None:
+        return datos
+
+    datos = {"detalles": {}, "tickets": [], "actualizado": ""}
+    if not DATABASE_URL:
+        return datos
+    try:
+        with db_cursor() as cur:
+            cur.execute("""
+                SELECT sucursal, camara, estado, observacion, actualizado_en
+                FROM estado_camaras_actual
+            """)
+            ultima = None
+            for suc, cam, est, obs, momento in cur.fetchall():
+                datos["detalles"].setdefault(suc, {})[cam] = {
+                    "estado": est,
+                    "observacion": obs or "",
+                }
+                if ultima is None or momento > ultima:
+                    ultima = momento
+            datos["actualizado"] = local_txt(ultima)
+            cur.execute("""
+                SELECT ticket, fecha, sucursal_area, estado, dias_abiertos, detalle
+                FROM reportes_tickets
+                ORDER BY id DESC
+            """)
+            datos["tickets"] = [
+                [str(t[0]), str(t[1]), str(t[2]), str(t[3]), str(t[4]), str(t[5] or "")]
+                for t in cur.fetchall()
+            ]
+        cache_guardar(datos)
+    except Exception:  # noqa: BLE001
+        logger.exception("Error leyendo datos de la base de datos")
+    return datos
+
+
+def cargar_historial(limite=200, sucursal=None):
+    """Últimos cambios registrados, más recientes primero (siempre desde la base de datos)."""
+    if not DATABASE_URL:
+        return []
+    consulta = """
+        SELECT cambiado_en, sucursal, camara, estado_anterior, estado_nuevo,
+               observacion_anterior, observacion_nueva, origen
+        FROM historial_cctv
     """
-    novedad = bool(s["novedades"])
-    iniciada = bool(s["hora_inicio"]) or s["revisadas"] > 0
-    cerrada = bool(s["hora_fin"]) or s.get("cuota_cumplida", False)
-    c_ini = ROJO if novedad else (VERDE if iniciada else CUADRO_VACIO)
-    c_fin = ROJO if novedad else (VERDE if cerrada else CUADRO_VACIO)
+    params = []
+    if sucursal:
+        consulta += " WHERE sucursal = %s"
+        params.append(sucursal)
+    consulta += " ORDER BY id DESC LIMIT %s"
+    params.append(limite)
+    try:
+        with db_cursor() as cur:
+            cur.execute(consulta, params)
+            return [
+                [local_txt(f[0]), f[1], f[2], f[3] or "(sin registro)", f[4], f[5] or "", f[6] or "", f[7] or ""]
+                for f in cur.fetchall()
+            ]
+    except Exception:  # noqa: BLE001
+        logger.exception("Error leyendo el historial")
+        return []
 
-    w0, w1 = 24, 205
-    w23 = (ANCHO - w0 - w1) / 2
-    base = [
-        ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+
+# ----------------------------------------------------------------------------
+# Cálculos
+# ----------------------------------------------------------------------------
+def estado_de(detalles, sucursal, camara):
+    info = detalles.get(sucursal, {}).get(camara)
+    return info["estado"] if info else "Por verificar"
+
+
+def resumen_sucursal(detalles, sucursal):
+    camaras = CATALOGO_CAMARAS[sucursal]
+    op = nv = pv = 0
+    for cam in camaras:
+        est = estado_de(detalles, sucursal, cam)
+        if est == "Operativa":
+            op += 1
+        elif est == "No visible":
+            nv += 1
+        else:
+            pv += 1
+    total = len(camaras)
+    disp = (op / total * 100) if total else 0
+    return total, op, nv, pv, disp
+
+
+def resumen_total(detalles):
+    total = op = nv = pv = 0
+    for suc in CATALOGO_CAMARAS:
+        t, o, n, p, _ = resumen_sucursal(detalles, suc)
+        total, op, nv, pv = total + t, op + o, nv + n, pv + p
+    disp = (op / total * 100) if total else 0
+    return total, op, nv, pv, disp
+
+
+def resumen_dict(detalles):
+    total, op, nv, pv, disp = resumen_total(detalles)
+    return {
+        "total": total,
+        "operativas": op,
+        "no_visibles": nv,
+        "por_verificar": pv,
+        "disponibilidad": disp,
+    }
+
+
+def nivel(disp):
+    if disp >= 90:
+        return "Óptimo"
+    if disp >= 60:
+        return "Atención"
+    return "Crítico"
+
+
+# ----------------------------------------------------------------------------
+# PDF
+# ----------------------------------------------------------------------------
+class NumberedCanvas(canvas.Canvas):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._saved_page_states = []
+
+    def showPage(self):
+        self._saved_page_states.append(dict(self.__dict__))
+        self._startPage()
+
+    def save(self):
+        num_pages = len(self._saved_page_states)
+        for state in self._saved_page_states:
+            self.__dict__.update(state)
+            self.draw_watermark_and_footer(num_pages)
+            super().showPage()
+        super().save()
+
+    def draw_watermark_and_footer(self, total_pages):
+        self.saveState()
+        self.setFont("Helvetica-Bold", 60)
+        self.setFillColor(colors.HexColor("#F2DEDE"), alpha=0.3)
+        self.translate(300, 400)
+        self.rotate(45)
+        self.drawCentredString(0, 0, "CONFIDENCIAL")
+        self.restoreState()
+
+        self.saveState()
+        self.setFont("Helvetica", 9)
+        self.setFillColor(colors.HexColor("#555555"))
+        self.drawString(36, 25, "INJUL - Consolidado Maestro de CCTV")
+        self.drawCentredString(letter[0] / 2, 25, f"Página {self._pageNumber} de {total_pages}")
+        self.drawRightString(letter[0] - 36, 25, "Documento confidencial")
+        self.setStrokeColor(colors.HexColor("#CCCCCC"))
+        self.setLineWidth(0.5)
+        self.line(36, 38, letter[0] - 36, 38)
+        self.restoreState()
+
+
+COLOR_ESTADO = {
+    "Operativa": "#DFF0D8",
+    "No visible": "#F2DEDE",
+    "Por verificar": "#FCF8E3",
+}
+COLOR_NIVEL = {"Óptimo": "#DFF0D8", "Atención": "#FCF8E3", "Crítico": "#F2DEDE"}
+
+
+def estilo_tabla(color_cabecera, extra=None):
+    comandos = [
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(color_cabecera)),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
     ]
-    nombre = Table([[Paragraph(_txt(_nombre_oficial(s["sucursal"])), E_SITIO), Cuadro(c_ini)]],
-                   colWidths=[w1 - 40, 18])
-    nombre.setStyle(TableStyle(base))
-    fin_cab = Table([[Paragraph("FIN", E_COL), Cuadro(c_fin)]], colWidths=[w23 - 30, 22])
-    fin_cab.setStyle(TableStyle(base + [("ALIGN", (1, 0), (1, 0), "RIGHT")]))
+    if extra:
+        comandos.extend(extra)
+    return TableStyle(comandos)
 
-    filas = [[nombre, "", Paragraph("INICIO", E_COL), fin_cab]]
-    for c in s["camaras"]:
-        filas.append([Casilla(c["revisada"]), Paragraph(_txt(c["nombre"]), E_CAM),
-                      Paragraph(_txt(c["hora_inicio"]), E_HORA), Paragraph(_txt(c["hora_fin"]), E_HORA)])
-    n = len(filas) - 1  # última fila de cámaras
 
-    filas.append([Paragraph("Novedades y acciones tomadas.", E_NOV_ETQ), "", "", ""])
-    if novedad:
-        cuerpo = "no:&nbsp;&nbsp;" + "<br/>".join(_txt(x) for x in _trozos(s["novedades"], 600))
+def grafica_estado(detalles):
+    """Barras horizontales apiladas: operativas / no visibles / por verificar por sucursal."""
+    nombres, ops, nvs, pvs = [], [], [], []
+    for suc in CATALOGO_CAMARAS:
+        _, o, n, p, _ = resumen_sucursal(detalles, suc)
+        nombres.append(suc)
+        ops.append(o)
+        nvs.append(n)
+        pvs.append(p)
+    maximo = max((o + n + p) for o, n, p in zip(ops, nvs, pvs))
+    tope = ((maximo // 10) + 1) * 10
+
+    dibujo = Drawing(540, 215)
+    ch = HorizontalBarChart()
+    ch.x, ch.y, ch.width, ch.height = 150, 22, 370, 165
+    ch.data = [ops, nvs, pvs]
+    ch.categoryAxis.categoryNames = nombres
+    ch.categoryAxis.style = "stacked"
+    ch.categoryAxis.reverseDirection = 1
+    ch.categoryAxis.labels.fontName = "Helvetica"
+    ch.categoryAxis.labels.fontSize = 7
+    ch.categoryAxis.labels.boxAnchor = "e"
+    ch.categoryAxis.labels.dx = -4
+    ch.valueAxis.valueMin = 0
+    ch.valueAxis.valueMax = tope
+    ch.valueAxis.valueStep = 10
+    ch.valueAxis.labels.fontName = "Helvetica"
+    ch.valueAxis.labels.fontSize = 7
+    ch.bars[0].fillColor = colors.HexColor("#2E9E2E")
+    ch.bars[1].fillColor = colors.HexColor("#D64545")
+    ch.bars[2].fillColor = colors.HexColor("#F0A91E")
+    ch.bars.strokeColor = None
+    dibujo.add(ch)
+
+    x = 150
+    for etiqueta, color in [("Operativas", "#2E9E2E"), ("No visibles", "#D64545"), ("Por verificar", "#F0A91E")]:
+        dibujo.add(Rect(x, 199, 8, 8, fillColor=colors.HexColor(color), strokeColor=None))
+        dibujo.add(String(x + 12, 200, etiqueta, fontName="Helvetica", fontSize=7, fillColor=colors.HexColor("#333333")))
+        x += 85
+    dibujo.add(String(335, 6, "Cantidad de cámaras", fontName="Helvetica", fontSize=7, textAnchor="middle", fillColor=colors.HexColor("#555555")))
+    return dibujo
+
+
+def hallazgos(datos):
+    detalles, tickets = datos["detalles"], datos["tickets"]
+    total, op, nv, pv, disp = resumen_total(detalles)
+    niveles = [nivel(resumen_sucursal(detalles, s)[4]) for s in CATALOGO_CAMARAS]
+    n_suc = len(CATALOGO_CAMARAS)
+    lista = [
+        f"Disponibilidad global de {disp:.1f}%: {op} de {total} cámaras operativas en EZStation. "
+        f"{niveles.count('Crítico')} de {n_suc} sucursales están en nivel crítico y "
+        f"{niveles.count('Óptimo')} en nivel óptimo."
+    ]
+    peor = max(CATALOGO_CAMARAS, key=lambda s: resumen_sucursal(detalles, s)[2])
+    t_peor, _, nv_peor, _, _ = resumen_sucursal(detalles, peor)
+    if nv_peor:
+        lista.append(f"{peor}: {nv_peor} de {t_peor} cámaras no visibles en EZStation (la sucursal con más fallas).")
+    genericas = sum(
+        1
+        for suc, camaras in CATALOGO_CAMARAS.items()
+        for cam in camaras
+        if estado_de(detalles, suc, cam) == "No visible" and cam.startswith("IP Camera")
+    )
+    if nv:
+        lista.append(f"{genericas} de las {nv} cámaras no visibles conservan el nombre genérico de canal («IP Camera NN»).")
+    if pv:
+        donde = ", ".join(
+            f"{s} ({resumen_sucursal(detalles, s)[3]})"
+            for s in CATALOGO_CAMARAS
+            if resumen_sucursal(detalles, s)[3]
+        )
+        lista.append(f"{pv} cámaras están «Por verificar»: {donde}.")
+    abiertos = [t for t in tickets if t[3] == "En proceso"]
+    if abiertos:
+        dias = []
+        for t in abiertos:
+            try:
+                dias.append(int(t[4]))
+            except ValueError:
+                pass
+        extra = f"; el más antiguo lleva {max(dias)} días abierto" if dias else ""
+        lista.append(f"Hay {len(abiertos)} tickets en proceso con el proveedor de {len(tickets)} registrados{extra}.")
     else:
-        cuerpo = 'no:&nbsp;&nbsp;<font name="Helvetica-Bold" color="#00C800">s/n</font>'
-    caja = _caja_redonda(Paragraph(cuerpo, E_NOV), ANCHO - 26, 28 if not novedad else None,
-                         CAJA, colors.HexColor("#E3E3E3"), 12)
-    filas.append([caja, "", "", ""])
-
-    t = Table(filas, colWidths=[w0, w1, w23, w23])
-    t.setStyle(TableStyle([
-        ("BOX", (0, 0), (-1, -1), 0.8, BORDE), ("ROUNDEDCORNERS", [4, 4, 4, 4]),
-        ("LINEBEFORE", (0, 0), (0, -1), 4, NAVY),
-        ("SPAN", (0, 0), (1, 0)), ("LINEBELOW", (0, 0), (-1, 0), 0.6, BORDE),
-        ("LINEBEFORE", (2, 1), (2, n), 3, colors.black), ("LINEBEFORE", (3, 1), (3, n), 3, colors.black),
-        ("SPAN", (0, n + 1), (-1, n + 1)), ("SPAN", (0, n + 2), (-1, n + 2)),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("ALIGN", (2, 0), (3, -1), "CENTER"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 4), ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-        ("TOPPADDING", (0, 0), (-1, -1), 1.6), ("BOTTOMPADDING", (0, 0), (-1, -1), 1.6),
-        ("LEFTPADDING", (0, 0), (0, -1), 10),
-        ("TOPPADDING", (0, 0), (-1, 0), 5), ("BOTTOMPADDING", (0, 0), (-1, 0), 3),
-        ("TOPPADDING", (0, n + 1), (-1, n + 1), 4), ("BOTTOMPADDING", (0, n + 2), (-1, n + 2), 7),
-        ("LEFTPADDING", (0, n + 2), (-1, n + 2), 14), ("RIGHTPADDING", (0, n + 2), (-1, n + 2), 8),
-    ]))
-    return t
+        lista.append(f"No hay tickets en proceso ({len(tickets)} registrados).")
+    return lista
 
 
-def _resumen(sitios_por_clave, ancho_barra):
-    """'RESUMEN INFORMATIVO DEL PROCESO': las 9 sedes oficiales (Boca Chica sin datos)."""
-    barra = Table([[Paragraph("RESUMEN INFORMATIVO DEL PROCESO", E_BARRA)]], colWidths=[ancho_barra])
-    barra.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), NAVY), ("ROUNDEDCORNERS", [4, 4, 0, 0]),
-        ("LEFTPADDING", (0, 0), (-1, -1), 8), ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-    ]))
-    c1, c2 = ANCHO * 0.40, ANCHO * 0.27
-    c3 = ANCHO - c1 - c2
-    filas = [[Paragraph("SEDE PRINCIPAL/SUCURSALES", E_TH), Paragraph("TOTAL CÁMARAS", E_TH),
-              Paragraph("CÁMARAS MONITOREADAS HOY", E_TH)]]
-    for clave, rotulo, total in RESUMEN_OFICIAL:
-        s = sitios_por_clave.get(clave)
-        estado = (EstadoMonitoreo(s["cuota_cumplida"], s["revisadas"], s["cuota"], bool(s["novedades"]))
-                  if s else "")
-        filas.append([Paragraph(_txt(rotulo), E_FILA), Paragraph(_txt(total), E_FILA), estado])
-    tabla = Table(filas, colWidths=[c1, c2, c3])
-    tabla.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), NAVY),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, FILA_ALT]),
-        ("GRID", (0, 1), (-1, -1), 0.5, colors.HexColor("#E3E3E3")),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("ALIGN", (2, 1), (2, -1), "LEFT"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 9), ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ("LEFTPADDING", (2, 1), (2, -1), 0),
-    ]))
-    return [barra, tabla]
+# --- Normalización de celdas del detalle por sucursal -----------------------
+# Cada valor sólo puede caer en SU columna: si el dato no pertenece al conjunto
+# oficial de esa columna, se muestra "—" en lugar de colarse en otra celda.
+EN_VIVO_OFICIAL = {"si": "Sí", "sí": "Sí", "no": "No", "intermitente": "Intermitente"}
+GRABACION_OFICIAL = {
+    "normal": "Normal",
+    "por movimiento": "Por movimiento",
+    "no graba": "No graba",
+}
+COLOR_TEXTO_EN_VIVO = {"Sí": "#2E7D32", "No": "#C62828", "Intermitente": "#B26A00"}
+COLOR_TEXTO_GRABACION = {"Normal": "#333333", "Por movimiento": "#333333", "No graba": "#C62828"}
+COLOR_TEXTO_ESTADO = {"Operativa": "#2E7D32", "No visible": "#C62828", "Por verificar": "#B26A00"}
 
 
-def construir_pdf_ciclico(estado):
-    turno = estado["turno"]
-    sitios = sorted(estado["sitios"], key=lambda s: ORDEN_OFICIAL.get(s["sucursal"], 99))
-    por_clave = {s["sucursal"]: s for s in sitios}
-    fecha_txt = _fecha_larga(estado["fecha"])
+def _valor_columna(info, claves, oficial):
+    """Lee el primer campo existente en `info` y lo valida contra el catálogo oficial."""
+    for clave in claves:
+        crudo = info.get(clave)
+        if crudo is None:
+            continue
+        valor = oficial.get(str(crudo).strip().lower())
+        if valor:
+            return valor
+    return "—"
+
+
+def _celda_color(texto, colores, estilo):
+    """Texto centrado en negrita con color propio (o gris para '—')."""
+    color = colores.get(texto, "#888888")
+    if texto == "—":
+        return Paragraph(f"<font color='{color}'>—</font>", estilo)
+    if color == "#333333":  # valores neutros (Normal / Por movimiento): texto normal
+        return Paragraph(esc(texto), estilo)
+    return Paragraph(f"<font color='{color}'><b>{esc(texto)}</b></font>", estilo)
+
+
+def filas_detalle_sucursal(detalles, suc, camaras, estilos):
+    """Devuelve (filas, comandos_extra) de la tabla de detalle de una sucursal.
+
+    Orden OFICIAL de columnas (siempre 6 celdas por fila):
+        [#, Ubicación / Nombre en EZStation, En vivo, Grabación, Estado, Observaciones]
+    """
+    celda_izq, celda_cen = estilos
+    filas = [["#", "Ubicación / Nombre en EZStation", "En vivo", "Grabación", "Estado", "Observaciones"]]
+    extra = []
+    for n, cam in enumerate(camaras, start=1):
+        info = detalles.get(suc, {}).get(cam) or {}
+        est = info.get("estado") or "Por verificar"
+        if est not in COLOR_ESTADO:
+            est = "Por verificar"
+        obs = str(info.get("observacion") or "").strip()
+        en_vivo = _valor_columna(info, ("en_vivo", "envivo"), EN_VIVO_OFICIAL)
+        grab = _valor_columna(info, ("grabacion", "grabación"), GRABACION_OFICIAL)
+        fila = [
+            str(n),                                              # 0  #
+            Paragraph(esc(cam), celda_izq),                      # 1  Ubicación / Nombre
+            _celda_color(en_vivo, COLOR_TEXTO_EN_VIVO, celda_cen),    # 2  En vivo
+            _celda_color(grab, COLOR_TEXTO_GRABACION, celda_cen),     # 3  Grabación
+            _celda_color(est, COLOR_TEXTO_ESTADO, celda_cen),         # 4  Estado
+            Paragraph(esc(obs), celda_izq),                      # 5  Observaciones
+        ]
+        assert len(fila) == 6
+        filas.append(fila)
+        extra.append(("BACKGROUND", (4, n), (4, n), colors.HexColor(COLOR_ESTADO[est])))
+    return filas, extra
+
+
+def construir_pdf(datos):
+    detalles = datos["detalles"]
+    tickets = datos["tickets"]
     buffer = BytesIO()
     doc = SimpleDocTemplate(
-        buffer, pagesize=A4, leftMargin=MARGEN_X, rightMargin=MARGEN_X,
-        topMargin=44, bottomMargin=36,
-        title=f"INJUL - Plan de Monitoreo Tiempo Real Cíclico Diario {fecha_txt}", author="INJUL",
+        buffer,
+        pagesize=letter,
+        leftMargin=36,
+        rightMargin=36,
+        topMargin=36,
+        bottomMargin=50,
+    )
+    title_style = ParagraphStyle(
+        "TitleStyle", fontName="Helvetica-Bold", fontSize=15, leading=19,
+        textColor=colors.HexColor("#1F497D"),
+    )
+    seccion_style = ParagraphStyle(
+        "SeccionStyle", fontName="Helvetica-Bold", fontSize=9, leading=12,
+        textColor=colors.HexColor("#1F497D"),
+    )
+    normal_style = ParagraphStyle(
+        "NormalStyle", fontName="Helvetica", fontSize=10, leading=14,
+        textColor=colors.HexColor("#333333"),
+    )
+    celda = ParagraphStyle("Celda", fontName="Helvetica", fontSize=8, leading=10)
+    celda_cen = ParagraphStyle(
+        "CeldaCentro", parent=celda, alignment=1, wordWrap="LTR",
+    )
+    celda_det = ParagraphStyle(
+        "CeldaDetalle", parent=celda, alignment=0, wordWrap="LTR", splitLongWords=True,
     )
     story = []
 
-    # 1) Banner
-    banner = Table([[Paragraph("CENTRO DE MONITOREO GENERAL MARMOTECH", E_TITULO)],
-                    [Paragraph("INJUL · Plan de Monitoreo Tiempo Real Cíclico Diario", E_SUB)]], colWidths=[ANCHO])
-    banner.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), NAVY), ("ROUNDEDCORNERS", [4, 4, 4, 4]),
-        ("TOPPADDING", (0, 0), (-1, 0), 12), ("BOTTOMPADDING", (0, 0), (-1, 0), 1),
-        ("TOPPADDING", (0, 1), (-1, 1), 1), ("BOTTOMPADDING", (0, 1), (-1, 1), 11),
-    ]))
-    story += [banner, Spacer(1, 10)]
-
-    # 2) Datos del turno
-    mitad = ANCHO / 2
-    fila1 = Table([[_campo("FECHA", fecha_txt, mitad - 10), _campo("DÍA DE ROTACIÓN", turno["dia_rotacion"], mitad - 10)],
-                   [_campo("DESDE", _hora12(turno["desde"]), mitad - 10), _campo("HASTA", _hora12(turno["hasta"]), mitad - 10)]],
-                  colWidths=[mitad, mitad])
-    fila1.setStyle(TableStyle([
-        ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-    ]))
-    story += [fila1, _campo("UBICACIÓN / SISTEMA", turno["ubicacion_sistema"], ANCHO), Spacer(1, 3),
-              _campo("RESPONSABLE DE TURNO", turno["responsable"], ANCHO), Spacer(1, 8)]
-
-    # 3) Resumen informativo
-    story += _resumen(por_clave, ANCHO - 4)
+    # --- PÁGINA 1: PORTADA + INDICADORES + ESTADO POR SUCURSAL + GRÁFICA ---
+    fecha_txt = ahora().strftime("%d/%m/%Y")
+    logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
+    encabezado = Paragraph(
+        "<b>INFORME CONSOLIDADO DE CCTV</b><br/>"
+        "<font size=8 color='#555555'>Investigadores Jurídicos EIRL - Supervisión en EZStation<br/>"
+        f"Fecha: {fecha_txt} | Rango: 07:00 AM - 07:00 PM<br/>"
+        "Elaborado por: Centro de Monitoreo INJUL</font>",
+        title_style,
+    )
+    if os.path.exists(logo_path):
+        logo_img = Image(logo_path, width=0.9 * inch, height=0.9 * inch)
+        t_header = Table([[logo_img, encabezado]], colWidths=[75, 465])
+        t_header.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE")]))
+        story.append(t_header)
+    else:
+        story.append(encabezado)
     story.append(Spacer(1, 10))
 
-    # 4) Un bloque fijo por sede (el agregado de Caribbean va al final, tras la firma)
-    for s in sitios:
-        if s["sucursal"] == AGREGADO_TRAS_FIRMA:
-            continue
-        if s["sucursal"] in SALTO_ANTES_DE:
-            story.append(PageBreak())
-        story += [KeepTogether([_bloque_sitio(s)]), Spacer(1, 8)]
-
-    # 5) Informe de novedades del turno + firma + pie
-    area = turno["area"] or ""
-    lineas = [f"Fecha: {fecha_txt}", f'Hora del informe: {estado.get("hora_informe", "")}',
-              f"Área: {area}", "Reporte de Monitoreo"]
-    cabecera = "".join(f"{_txt(x)}<br/>" for x in lineas)
-    cuerpo = (turno["informe_novedades"] or "Sin observaciones generales registradas.").strip()
-    nombre_resp = _txt(turno["responsable"])
-    filas_inf = [[Paragraph(f"INFORME DE NOVEDADES{_turno_nombre(turno['desde'])}", E_INF_T)],
-                 [Paragraph(cabecera, E_INF)]]
-    # El cuerpo va en filas cortas para que un informe extenso nunca rompa el PDF.
-    filas_inf += [[Paragraph(_txt(x) or "&nbsp;", E_INF)] for x in _trozos(cuerpo)]
-    filas_inf.append([_caja_redonda(
-        Paragraph(f"<b>{nombre_resp}</b>" if nombre_resp else "&nbsp;", _ps("r", fontName="Helvetica-Bold", fontSize=7.5)),
-        ANCHO - 34, 26, CAJA, colors.HexColor("#E3E3E3"), 28)])
-    n_inf = len(filas_inf)
-    informe = Table(filas_inf, colWidths=[ANCHO])
-    informe.setStyle(TableStyle([
-        ("BOX", (0, 0), (-1, -1), 0.8, BORDE), ("ROUNDEDCORNERS", [4, 4, 4, 4]),
-        ("LINEBEFORE", (0, 0), (0, -1), 4, NAVY), ("LINEBELOW", (0, 0), (0, 0), 0.6, BORDE),
-        ("LEFTPADDING", (0, 0), (-1, -1), 24), ("RIGHTPADDING", (0, 0), (-1, -1), 18),
-        ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-        ("TOPPADDING", (0, 0), (-1, 0), 8), ("BOTTOMPADDING", (0, 0), (-1, 0), 5),
-        ("TOPPADDING", (0, 1), (-1, 1), 6), ("BOTTOMPADDING", (0, n_inf - 2), (-1, n_inf - 2), 10),
-        ("TOPPADDING", (0, n_inf - 1), (-1, n_inf - 1), 4), ("BOTTOMPADDING", (0, n_inf - 1), (-1, n_inf - 1), 9),
-    ]))
-    firma = [
-        Paragraph("FIRMA DEL RESPONSABLE", _ps("f", fontName="Helvetica-Bold", fontSize=8, textColor=GRIS_ETQ)),
-        Spacer(1, 4),
-        _caja_redonda(Paragraph(f"<b>{nombre_resp}</b>" if nombre_resp else "&nbsp;", _ps("fr", fontName="Helvetica-Bold", fontSize=7.5)),
-                      ANCHO, 28, colors.white, BORDE, 40),
-        Spacer(1, 5),
-        Paragraph("Los datos se guardan en este dispositivo por fecha.", E_PIE),
+    total, op, nv, pv, disp = resumen_total(detalles)
+    en_proceso = sum(1 for t in tickets if t[3] == "En proceso")
+    pct = lambda x: f"{(x / total * 100) if total else 0:.0f}% del total"  # noqa: E731
+    story.append(Paragraph("INDICADORES CLAVE", seccion_style))
+    kpi = [
+        ["Cámaras supervisadas", "Operativas", "No visibles", "Por verificar", "Disponibilidad", "Tickets en proceso"],
+        [str(total), str(op), str(nv), str(pv), f"{disp:.1f}%", str(en_proceso)],
+        [f"en {len(CATALOGO_CAMARAS)} sucursales", pct(op), pct(nv), "por confirmar", "operativas / total", f"de {len(tickets)} registrados"],
     ]
-    story += [informe, Spacer(1, 14)] + firma
+    t_kpi = Table(kpi, colWidths=[90] * 6)
+    t_kpi.setStyle(
+        TableStyle([
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 7),
+            ("FONTNAME", (0, 1), (-1, 1), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 1), (-1, 1), 16),
+            ("FONTSIZE", (0, 2), (-1, 2), 7),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#555555")),
+            ("TEXTCOLOR", (1, 1), (1, 1), colors.HexColor("#2E9E2E")),
+            ("TEXTCOLOR", (2, 1), (2, 1), colors.HexColor("#D64545")),
+            ("TEXTCOLOR", (3, 1), (3, 1), colors.HexColor("#C98A00")),
+            ("TEXTCOLOR", (0, 1), (0, 1), colors.HexColor("#1F497D")),
+            ("TEXTCOLOR", (4, 1), (5, 1), colors.HexColor("#1F497D")),
+            ("TEXTCOLOR", (0, 2), (-1, 2), colors.HexColor("#777777")),
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F8F9FA")),
+            ("LINEABOVE", (0, 0), (-1, 0), 1.5, colors.HexColor("#1F497D")),
+            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#DDDDDD")),
+        ])
+    )
+    story.append(t_kpi)
+    story.append(Spacer(1, 10))
 
-    # 6) Bloque "Caribbean agregado": página aparte, como en el formato oficial
-    if AGREGADO_TRAS_FIRMA in por_clave:
-        story += [PageBreak(), _bloque_sitio(por_clave[AGREGADO_TRAS_FIRMA])]
+    story.append(Paragraph("ESTADO POR SUCURSAL", seccion_style))
+    story.append(Paragraph(
+        "<font size=6 color='#777777'>Disponibilidad = cámaras operativas / total de cámaras de la sucursal. "
+        "Nivel: Óptimo ≥ 90 % · Atención 60-89 % · Crítico &lt; 60 %.</font>", normal_style))
+    filas = [["#", "Sucursal", "Total", "Operativas", "No visibles", "Por verificar", "Disponib.", "Nivel"]]
+    extra = [("ALIGN", (1, 1), (1, -1), "LEFT")]
+    for i, suc in enumerate(CATALOGO_CAMARAS, start=1):
+        t, o, n, p, d = resumen_sucursal(detalles, suc)
+        niv = nivel(d)
+        filas.append([str(i), suc, str(t), str(o), str(n), str(p), f"{d:.1f}%", niv])
+        extra.append(("BACKGROUND", (7, i), (7, i), colors.HexColor(COLOR_NIVEL[niv])))
+    filas.append(["", "TOTAL GENERAL", str(total), str(op), str(nv), str(pv), f"{disp:.1f}%", nivel(disp)])
+    extra += [
+        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+        ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#E9EEF5")),
+        ("BACKGROUND", (7, -1), (7, -1), colors.HexColor(COLOR_NIVEL[nivel(disp)])),
+    ]
+    t_res = Table(filas, colWidths=[22, 150, 40, 62, 62, 70, 70, 64], repeatRows=1)
+    t_res.setStyle(estilo_tabla("#1F497D", extra))
+    story.append(t_res)
+    story.append(Spacer(1, 10))
 
-    doc.build(story)
+    story.append(Paragraph("DISTRIBUCIÓN DEL ESTADO POR SUCURSAL", seccion_style))
+    story.append(grafica_estado(detalles))
+    story.append(PageBreak())
+
+    # --- PÁGINA 2: HALLAZGOS ---
+    story.append(Paragraph("<b>Hallazgos del Día</b>", title_style))
+    story.append(Spacer(1, 10))
+    for n, texto in enumerate(hallazgos(datos), start=1):
+        story.append(Paragraph(f"<b>{n}.</b> {esc(texto)}", normal_style))
+        story.append(Spacer(1, 6))
+    if datos.get("actualizado"):
+        story.append(Spacer(1, 6))
+        story.append(Paragraph(
+            f"<font size=8 color='#777777'>Último cambio registrado en el sistema: {esc(datos['actualizado'])}</font>",
+            normal_style))
+    story.append(PageBreak())
+
+    # --- UNA SECCIÓN POR SUCURSAL ---
+    total_suc = len(CATALOGO_CAMARAS)
+    for idx, (suc, camaras) in enumerate(CATALOGO_CAMARAS.items(), start=1):
+        story.append(Paragraph(f"<b>Sucursal {idx} de {total_suc}: {esc(suc)}</b>", title_style))
+        story.append(Spacer(1, 10))
+        filas, extra = filas_detalle_sucursal(detalles, suc, camaras, (celda_det, celda_cen))
+        extra += [
+            ("ALIGN", (0, 1), (0, -1), "CENTER"),
+            ("ALIGN", (1, 0), (1, 0), "LEFT"),
+            ("ALIGN", (5, 0), (5, 0), "LEFT"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+            ("TOPPADDING", (0, 1), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 1), (-1, -1), 3),
+        ]
+        # Anchos fijos (suman 540 pt = ancho útil de la página)
+        t_suc = Table(filas, colWidths=[24, 170, 60, 80, 70, 136], repeatRows=1)
+        t_suc.setStyle(estilo_tabla("#1F2A44", extra))
+        story.append(t_suc)
+        story.append(PageBreak())
+
+    # --- TICKETS ---
+    story.append(Paragraph("<b>Seguimiento de Tickets con el Proveedor</b>", title_style))
+    story.append(Spacer(1, 10))
+    filas = [["Ticket", "Fecha", "Sucursal / Área", "Estado", "Días", "Detalle"]]
+    if tickets:
+        for t in tickets:
+            filas.append([
+                Paragraph(esc(t[0]), celda), t[1], Paragraph(esc(t[2]), celda),
+                t[3], t[4], Paragraph(esc(t[5]), celda),
+            ])
+    else:
+        filas.append(["N/A", "N/A", "Sin tickets registrados", "N/A", "0", "N/A"])
+    t_tickets = Table(filas, colWidths=[60, 70, 120, 70, 40, 170], repeatRows=1)
+    t_tickets.setStyle(estilo_tabla("#1F497D"))
+    story.append(t_tickets)
+
+    doc.build(story, canvasmaker=NumberedCanvas)
     buffer.seek(0)
     return buffer
 
 
-def construir_excel_ciclico(estado):
-    turno, sitios = estado["turno"], estado["sitios"]
-    fecha_txt = _fecha_larga(estado["fecha"])
-    wb = Workbook()
-    cab_fill = PatternFill("solid", fgColor="0F3A63")
-    cab_font = Font(bold=True, color="FFFFFF")
-    ok_fill = PatternFill("solid", fgColor="EEF7EE")
-    ajustar = Alignment(wrap_text=True, vertical="top")
+# ----------------------------------------------------------------------------
+# Excel
+# ----------------------------------------------------------------------------
+def construir_excel(datos, historial):
+    detalles = datos["detalles"]
+    tickets = datos["tickets"]
+    azul = PatternFill("solid", fgColor="1F497D")
+    blanco = Font(bold=True, color="FFFFFF")
+    rellenos = {
+        "Operativa": PatternFill("solid", fgColor="DFF0D8"),
+        "No visible": PatternFill("solid", fgColor="F2DEDE"),
+        "Por verificar": PatternFill("solid", fgColor="FCF8E3"),
+    }
 
-    def cabecera(ws, fila, textos):
-        for c, tx in enumerate(textos, start=1):
-            celda = ws.cell(row=fila, column=c, value=tx)
-            celda.fill, celda.font = cab_fill, cab_font
+    def cabecera(ws, fila, titulos):
+        for col, titulo in enumerate(titulos, start=1):
+            c = ws.cell(row=fila, column=col, value=titulo)
+            c.fill, c.font = azul, blanco
+            c.alignment = Alignment(horizontal="center", vertical="center")
 
-    # Hoja 1: Resumen del turno
+    wb = openpyxl.Workbook()
+
+    # Hoja 1: resumen
     ws = wb.active
     ws.title = "Resumen"
-    ws["A1"] = "CENTRO DE MONITOREO GENERAL MARMOTECH — Plan de Monitoreo Cíclico Diario"
-    ws["A1"].font = Font(bold=True, size=13, color="0F3A63")
-    datos = [("Fecha", fecha_txt), ("Día de rotación", turno["dia_rotacion"]), ("Desde", turno["desde"]),
-             ("Hasta", turno["hasta"]), ("Ubicación / Sistema", turno["ubicacion_sistema"]),
-             ("Responsable de turno", turno["responsable"]), ("Área", turno["area"])]
-    for i, (k, v) in enumerate(datos, start=3):
-        ws.cell(row=i, column=1, value=k).font = Font(bold=True)
-        ws.cell(row=i, column=2, value=v or "")
-    fila = len(datos) + 4
-    cabecera(ws, fila, ["Sede / Sucursal", "Cuadros del ciclo", "Revisadas", "Cuota cumplida", "Inicio", "Fin", "Novedades y acciones tomadas"])
-    for s in sitios:
+    ws["A1"] = "INJUL - Consolidado de CCTV"
+    ws["A1"].font = Font(size=14, bold=True, color="1F497D")
+    ws["A2"] = f"Fecha: {ahora().strftime('%d/%m/%Y')}"
+    cabecera(ws, 4, ["Sucursal", "Total", "Operativas", "No visibles", "Por verificar", "Disponibilidad %", "Nivel"])
+    fila = 5
+    for suc in CATALOGO_CAMARAS:
+        t, o, n, p, d = resumen_sucursal(detalles, suc)
+        for col, valor in enumerate([suc, t, o, n, p, round(d, 1), nivel(d)], start=1):
+            ws.cell(row=fila, column=col, value=valor)
         fila += 1
-        completo = s["cuota_cumplida"]
-        valores = [s["sucursal"], s["total"], s["revisadas"], "Sí" if completo else "No",
-                   s["hora_inicio"], s["hora_fin"], s["novedades"] or "s/n"]
-        for c, v in enumerate(valores, start=1):
-            celda = ws.cell(row=fila, column=c, value=v)
-            celda.alignment = ajustar
-            if completo:
-                celda.fill = ok_fill
-    fila += 1
-    ws.cell(row=fila, column=1, value="TOTAL").font = Font(bold=True)
-    ws.cell(row=fila, column=2, value=sum(s["total"] for s in sitios)).font = Font(bold=True)
-    ws.cell(row=fila, column=3, value=sum(s["revisadas"] for s in sitios)).font = Font(bold=True)
-    fila += 2
-    ws.cell(row=fila, column=1, value="Informe de novedades del turno").font = Font(bold=True, color="0F3A63")
-    fila += 1
-    ws.cell(row=fila, column=1, value=turno["informe_novedades"] or "Sin observaciones generales registradas.").alignment = ajustar
-    ws.merge_cells(start_row=fila, start_column=1, end_row=fila, end_column=7)
-    ws.row_dimensions[fila].height = 90
-    for col, ancho in zip("ABCDEFG", [30, 16, 12, 11, 9, 9, 60]):
+    t, o, n, p, d = resumen_total(detalles)
+    for col, valor in enumerate(["TOTAL", t, o, n, p, round(d, 1), nivel(d)], start=1):
+        ws.cell(row=fila, column=col, value=valor).font = Font(bold=True)
+    for col, ancho in zip("ABCDEFG", [34, 10, 12, 13, 14, 18, 12]):
         ws.column_dimensions[col].width = ancho
 
-    # Hoja 2: Detalle por cámara
-    wd = wb.create_sheet("Detalle cámaras")
-    cabecera(wd, 1, ["Fecha", "Sucursal", "#", "Cámara", "Revisada", "Hora inicio", "Hora fin"])
-    r = 1
-    for s in sitios:
-        for c in s["camaras"]:
-            r += 1
-            for col, v in enumerate([fecha_txt, s["sucursal"], c["idx"] + 1, c["nombre"],
-                                     "Sí" if c["revisada"] else "No", c["hora_inicio"], c["hora_fin"]], start=1):
-                celda = wd.cell(row=r, column=col, value=v)
-                if c["revisada"]:
-                    celda.fill = ok_fill
-    wd.freeze_panes = "A2"
-    wd.auto_filter.ref = f"A1:G{max(r, 2)}"
-    for i, ancho in enumerate([12, 28, 6, 38, 10, 12, 10], start=1):
-        wd.column_dimensions[get_column_letter(i)].width = ancho
+    # Hoja 2: matriz de cámaras
+    wm = wb.create_sheet("Matriz")
+    cabecera(wm, 1, ["Sucursal", "#", "Cámara (EZStation)", "Estado", "Observación"])
+    fila = 2
+    for suc, camaras in CATALOGO_CAMARAS.items():
+        for n, cam in enumerate(camaras, start=1):
+            est = estado_de(detalles, suc, cam)
+            obs = detalles.get(suc, {}).get(cam, {}).get("observacion", "")
+            for col, valor in enumerate([suc, n, cam, est, obs], start=1):
+                wm.cell(row=fila, column=col, value=valor)
+            wm.cell(row=fila, column=4).fill = rellenos.get(est, rellenos["Por verificar"])
+            fila += 1
+    wm.freeze_panes = "A2"
+    for col, ancho in zip("ABCDE", [30, 6, 42, 16, 50]):
+        wm.column_dimensions[col].width = ancho
+
+    # Hoja 3: tickets
+    wt = wb.create_sheet("Tickets")
+    cabecera(wt, 1, ["Ticket", "Fecha", "Sucursal / Área", "Estado", "Días abiertos", "Detalle"])
+    for fila, t in enumerate(tickets, start=2):
+        for col, valor in enumerate(t, start=1):
+            wt.cell(row=fila, column=col, value=valor)
+    wt.freeze_panes = "A2"
+    for col, ancho in zip("ABCDEF", [14, 14, 30, 14, 14, 60]):
+        wt.column_dimensions[col].width = ancho
+
+    # Hoja 4: historial de cambios (trazabilidad)
+    wh = wb.create_sheet("Historial")
+    cabecera(wh, 1, ["Fecha y hora", "Sucursal", "Cámara", "Estado anterior", "Estado nuevo",
+                     "Observación anterior", "Observación nueva", "Origen"])
+    for fila, h in enumerate(historial, start=2):
+        for col, valor in enumerate(h, start=1):
+            wh.cell(row=fila, column=col, value=valor)
+    wh.freeze_panes = "A2"
+    for col, ancho in zip("ABCDEFGH", [24, 28, 34, 16, 16, 36, 36, 16]):
+        wh.column_dimensions[col].width = ancho
 
     buffer = BytesIO()
     wb.save(buffer)
@@ -1333,465 +1244,192 @@ def construir_excel_ciclico(estado):
     return buffer
 
 
-def _fecha_descarga():
-    return _fecha_de(request.args.get("fecha")) or _cfg["ahora"]().date()
+# ----------------------------------------------------------------------------
+# Rutas
+# ----------------------------------------------------------------------------
+@app.route("/health")
+def health():
+    return "ok", 200
 
 
-def _respuesta_descarga(constructor, extension, mimetype):
-    if not _cfg["database_url"]:
-        return Response("Base de datos no configurada (falta DATABASE_URL).", status=503)
-    fecha = _fecha_descarga()
+@app.route("/")
+def index():
+    tipo, mensaje = MENSAJES.get(request.args.get("msg"), (None, None))
     try:
-        estado = _estado_para_reporte(fecha)
-        buffer = constructor(estado)
+        seleccion = int(request.args.get("s", 0))
+    except ValueError:
+        seleccion = 0
+    datos = cargar_datos()
+    return render_template_string(
+        HTML_TEMPLATE,
+        catalogo=CATALOGO_CAMARAS,
+        detalles=datos["detalles"],
+        resumen=resumen_dict(datos["detalles"]),
+        estados=ESTADOS,
+        clases=CLASES_ESTADO,
+        mensaje=mensaje,
+        tipo=tipo,
+        seleccion=seleccion,
+    )
+
+
+@app.route("/api/camara", methods=["POST"])
+def api_camara():
+    """Guarda al instante el estado/observación de UNA cámara y registra el cambio en el historial."""
+    datos_in = request.get_json(silent=True) or {}
+    sucursal = datos_in.get("sucursal")
+    estado = datos_in.get("estado")
+    observacion = str(datos_in.get("observacion") or "").strip()[:500]
+    idx = datos_in.get("idx")
+
+    if sucursal not in CATALOGO_CAMARAS:
+        return jsonify(ok=False, error="Sucursal no válida"), 400
+    if not isinstance(idx, int) or isinstance(idx, bool) or not 0 <= idx < len(CATALOGO_CAMARAS[sucursal]):
+        return jsonify(ok=False, error="Cámara no válida"), 400
+    if estado not in ESTADOS_VALIDOS:
+        return jsonify(ok=False, error="Estado no válido"), 400
+    if not DATABASE_URL:
+        return jsonify(ok=False, error="Base de datos no configurada"), 503
+
+    camara = CATALOGO_CAMARAS[sucursal][idx]
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                """
+                SELECT estado, observacion FROM estado_camaras_actual
+                WHERE sucursal = %s AND camara = %s FOR UPDATE
+                """,
+                (sucursal, camara),
+            )
+            previo = cur.fetchone()
+            est_ant = previo[0] if previo else None
+            obs_ant = (previo[1] or "") if previo else None
+            cambiado = previo is None or est_ant != estado or obs_ant != observacion
+            if cambiado:
+                cur.execute(
+                    """
+                    INSERT INTO estado_camaras_actual (sucursal, camara, estado, observacion, actualizado_en)
+                    VALUES (%s, %s, %s, %s, NOW())
+                    ON CONFLICT (sucursal, camara) DO UPDATE
+                    SET estado = EXCLUDED.estado,
+                        observacion = EXCLUDED.observacion,
+                        actualizado_en = NOW()
+                    """,
+                    (sucursal, camara, estado, observacion),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO historial_cctv
+                        (sucursal, camara, estado_anterior, estado_nuevo,
+                         observacion_anterior, observacion_nueva, origen)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (sucursal, camara, est_ant, estado, obs_ant, observacion, ip_cliente()),
+                )
     except Exception:  # noqa: BLE001
-        logger.exception("Error generando reporte cíclico (%s)", fecha.isoformat())
-        return Response("No se pudo generar el reporte. Intente de nuevo.", status=500,
-                        mimetype="text/plain")
-    respuesta = send_file(
-        buffer, mimetype=mimetype, as_attachment=True,
-        download_name=f"Monitoreo_Ciclico_INJUL_{fecha.isoformat()}.{extension}",
+        logger.exception("Error guardando cámara")
+        return jsonify(ok=False, error="No se pudo guardar"), 500
+
+    # La escritura ya está confirmada en Postgres: se invalida Redis y se recarga
+    # de inmediato, así el panel y el próximo reporte ya ven el dato nuevo.
+    cache_invalidar()
+    datos = cargar_datos()
+    return jsonify(ok=True, cambiado=cambiado, resumen=resumen_dict(datos["detalles"]))
+
+
+@app.route("/guardar-ticket", methods=["POST"])
+def guardar_ticket():
+    ticket = (request.form.get("ticket") or "").strip()[:50]
+    sucursal_area = (request.form.get("sucursal_area") or "").strip()[:150]
+    estado_ticket = request.form.get("estado_ticket") or "En proceso"
+    if estado_ticket not in ("En proceso", "Terminado"):
+        estado_ticket = "En proceso"
+    detalle = (request.form.get("detalle") or "").strip()
+    try:
+        dias_abiertos = max(0, int(request.form.get("dias_abiertos") or 0))
+    except ValueError:
+        dias_abiertos = 0
+
+    if not ticket or not sucursal_area:
+        return redirect(url_for("index", msg="error"))
+    if not DATABASE_URL:
+        return redirect(url_for("index", msg="sin_db"))
+
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO reportes_tickets
+                    (fecha, ticket, sucursal_area, estado, dias_abiertos, detalle)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (ahora().strftime("%Y-%m-%d"), ticket, sucursal_area, estado_ticket, dias_abiertos, detalle),
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception("Error guardando ticket")
+        return redirect(url_for("index", msg="error"))
+
+    cache_invalidar()
+    cargar_datos()
+    return redirect(url_for("index", msg="ticket_ok"))
+
+
+@app.route("/historial")
+def historial():
+    filtro = request.args.get("sucursal") or ""
+    if filtro not in CATALOGO_CAMARAS:
+        filtro = ""
+    return render_template_string(
+        HISTORIAL_TEMPLATE,
+        filas=cargar_historial(200, filtro or None),
+        catalogo=CATALOGO_CAMARAS,
+        filtro=filtro,
     )
-    respuesta.headers["Cache-Control"] = "no-store"  # siempre datos recién guardados
-    return respuesta
 
 
-@bp.route("/descargar-pdf")
+@app.route("/descargar-pdf")
 def descargar_pdf():
-    # PDF institucional: formato inalterable (siempre los cuadros oficiales de cada sede).
-    return _respuesta_descarga(construir_pdf_ciclico, "pdf", "application/pdf")
+    buffer = construir_pdf(cargar_datos())
+    return send_file(
+        buffer,
+        mimetype="application/pdf",
+        as_attachment=True,
+        download_name="Reporte_CCTV_INJUL.pdf",
+    )
 
 
-@bp.route("/descargar-excel")
+@app.route("/descargar-excel")
 def descargar_excel():
-    return _respuesta_descarga(
-        construir_excel_ciclico, "xlsx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    buffer = construir_excel(cargar_datos(), cargar_historial(5000))
+    return send_file(
+        buffer,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name="Reporte_CCTV_INJUL.xlsx",
     )
 
 
-# ----------------------------------------------------------------------------
-# Registro en la app principal
-# ----------------------------------------------------------------------------
-def registrar(app, catalogo, db_cursor, ahora, local_txt, ip_cliente, database_url,
-              pool=None, ancla=None, no_visibles=None, inventario_de=None):
-    _cfg.update(
-        catalogo=catalogo, db_cursor=db_cursor, ahora=ahora, local_txt=local_txt,
-        ip_cliente=ip_cliente, database_url=database_url,
-        pool=pool or catalogo, ancla=ancla or date(2026, 10, 24),
-        no_visibles=no_visibles, inventario_de=inventario_de or {},
-    )
-    app.register_blueprint(bp)
-    if database_url:
-        try:
-            with db_cursor() as cur:
-                crear_tablas(cur)
-        except Exception:  # noqa: BLE001
-            logger.exception("No se pudieron crear las tablas del módulo cíclico")
+# --- Módulo independiente: Plan de Monitoreo Cíclico y Novedades (/ciclico) ---
+# Tiene sus propias tablas (ciclico_*) y rutas; sólo lee CATALOGO_CICLICO.
+import ciclico  # noqa: E402
 
+ciclico.registrar(
+    app,
+    catalogo=CATALOGO_CICLICO,
+    pool=POOL_CICLICO,
+    ancla=ANCLA_ROTACION,
+    no_visibles=camaras_no_visibles,
+    inventario_de=INVENTARIO_DE,
+    db_cursor=db_cursor,
+    ahora=ahora,
+    local_txt=local_txt,
+    ip_cliente=ip_cliente,
+    database_url=DATABASE_URL,
+)
 
-ESTILO = """
-<style>
-  * { box-sizing: border-box; }
-  body { font-family: Arial, sans-serif; background: #f4f6f9; color: #333; margin: 0; padding: 12px; }
-  .wrap { max-width: 1000px; margin: 0 auto; }
-  .banner { background: #0f3a63; color: #fff; border-radius: 8px; padding: 14px 16px; text-align: center; }
-  .banner h1 { margin: 0; font-size: 19px; letter-spacing: .5px; }
-  .banner p { margin: 4px 0 0; font-size: 13px; opacity: .9; }
-  .nav { margin: 10px 0; display: flex; gap: 8px; flex-wrap: wrap; }
-  .btn { display: inline-block; background: #1F497D; color: #fff; padding: 9px 14px; border: 0;
-         border-radius: 4px; font-weight: bold; font-size: 13px; text-decoration: none; cursor: pointer; }
-  .btn.gris { background: #6c757d; } .btn.verde { background: #2e7d32; }
-  .btn.chico { padding: 5px 8px; font-size: 12px; }
-  .card { background: #fff; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,.08);
-          padding: 14px; margin-bottom: 14px; border-left: 4px solid #0f3a63; }
-  .card h2 { margin: 0 0 10px; font-size: 15px; color: #0f3a63; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
-  label { display: block; font-size: 11px; font-weight: bold; color: #555; margin-bottom: 3px; text-transform: uppercase; }
-  input[type=text], input[type=date], input[type=time], select, textarea {
-    width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; background: #fff; }
-  textarea { min-height: 90px; resize: vertical; font-family: inherit; }
-  table { width: 100%; border-collapse: collapse; }
-  th { background: #0f3a63; color: #fff; font-size: 12px; text-align: left; padding: 7px; }
-  td { border-bottom: 1px solid #e3e3e3; padding: 6px 7px; font-size: 13px; }
-  tr.hecho td { background: #eef7ee; }
-  .ok { color: #2e7d32; font-weight: bold; } .pend { color: #b26a00; font-weight: bold; }
-  .estado { position: fixed; right: 12px; bottom: 12px; background: #333; color: #fff; padding: 7px 12px;
-            border-radius: 16px; font-size: 12px; opacity: .92; }
-  .estado.error { background: #a94442; } .estado.ok { background: #2e7d32; }
-  .descargas { display: flex; gap: 10px; flex-wrap: wrap; }
-  .descargas .btn { flex: 1 1 200px; text-align: center; padding: 12px 14px; font-size: 14px; }
-  .btn.rojo { background: #c0392b; }
-  .btn.cargando { opacity: .6; pointer-events: none; }
-  @media (max-width: 520px) { .nav .btn { flex: 1 1 100%; text-align: center; } }
-  .vacio { color: #888; padding: 12px; text-align: center; }
-</style>
-"""
+# Se ejecuta al importar, para que funcione tanto con gunicorn como con python main.py
+inicializar_base_de_datos()
 
-PAGINA = """<!DOCTYPE html>
-<html lang="es"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>INJUL - Monitoreo Cíclico</title>%%ESTILO%%
-<style>
-  .cam { display: grid; grid-template-columns: 34px 1fr 96px 96px 34px; gap: 6px; align-items: center;
-         padding: 6px 4px; border-bottom: 1px solid #e3e3e3; }
-  .cam.hecho { background: #eef7ee; }
-  .cam input[type=checkbox] { width: 24px; height: 24px; cursor: pointer; }
-  .cam input[type=time] { padding: 5px; font-size: 13px; }
-  .cam .nom { font-size: 13px; color: #0f3a63; }
-  .cam.cab { font-size: 11px; font-weight: bold; color: #555; text-transform: uppercase; }
-  .barra { background: #e3e3e3; border-radius: 6px; height: 10px; overflow: hidden; margin: 6px 0 10px; }
-  .barra > div { background: #2e7d32; height: 100%; width: 0; transition: width .2s; }
-  .tiempos { display: flex; gap: 8px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 8px; }
-  .tiempos > div { width: 130px; }
-  .cam .cmb { padding: 4px 0; font-size: 14px; }
-  .cambio { background: #f1f5fa; border: 1px solid #cfd9e6; border-radius: 6px; padding: 8px; margin: 2px 0 6px; }
-  .cambio .res { max-height: 190px; overflow-y: auto; margin-top: 6px; }
-  .cambio .opc { padding: 7px 8px; border-bottom: 1px solid #e3e3e3; font-size: 13px; cursor: pointer; background: #fff; }
-  .cambio .opc.usada { color: #999; cursor: default; background: #f4f4f4; }
-  .rotinfo { font-size: 12px; color: #555; background: #eef2f7; border-radius: 4px; padding: 6px 8px; margin-bottom: 8px; }
-  .fechanav { display: flex; gap: 6px; }
-  .fechanav input { flex: 1; }
-  @media (max-width: 520px) { .cam { grid-template-columns: 34px 1fr 78px 78px 30px; } }
-</style></head><body><div class="wrap">
-  <div class="banner">
-    <h1>CENTRO DE MONITOREO GENERAL MARMOTECH</h1>
-    <p>INJUL · Plan de Monitoreo Tiempo Real Cíclico Diario</p>
-  </div>
-  <div class="nav">
-    <a class="btn gris" href="/">← Consolidado CCTV</a>
-    <a class="btn gris" href="/ciclico/historial">Historial de turnos</a>
-    <a class="btn gris" id="lnk-aud" href="#">Auditoría del día</a>
-    <a class="btn rojo" id="dl-pdf-top" href="#">⬇ PDF oficial</a>
-    <a class="btn verde" id="dl-xlsx-top" href="#">⬇ Excel</a>
-  </div>
-
-  <div class="card"><h2>Datos del turno</h2>
-    <div class="grid">
-      <div><label>Fecha (las cámaras rotan cada día)</label>
-        <div class="fechanav"><button class="btn chico gris" type="button" id="f-ant" title="Día anterior">◀</button>
-        <input type="date" id="f-fecha" value="{{ fecha }}">
-        <button class="btn chico gris" type="button" id="f-sig" title="Día siguiente">▶</button></div></div>
-      <div><label>Día de rotación</label><input type="text" id="t-dia_rotacion" maxlength="40"></div>
-      <div><label>Desde</label><input type="time" id="t-desde"></div>
-      <div><label>Hasta</label><input type="time" id="t-hasta"></div>
-      <div><label>Ubicación / Sistema</label><input type="text" id="t-ubicacion_sistema" maxlength="150"></div>
-      <div><label>Responsable de turno</label><input type="text" id="t-responsable" maxlength="120"></div>
-    </div>
-  </div>
-
-  <div class="card"><h2>Resumen informativo del proceso</h2>
-    <table><thead><tr><th>Sede / Sucursal</th><th>Cuadros del ciclo</th><th>Revisadas hoy</th>
-      <th>Inicio</th><th>Fin</th><th>Novedad</th></tr></thead>
-      <tbody id="resumen"></tbody></table>
-  </div>
-
-  <div class="card"><h2>Revisión por sucursal</h2>
-    <label>Sucursal</label><select id="sel-suc"></select>
-    <div id="panel" style="margin-top:12px"></div>
-  </div>
-
-  <div class="card"><h2>Informe de novedades del turno</h2>
-    <div class="grid" style="margin-bottom:10px">
-      <div><label>Área</label><input type="text" id="t-area" maxlength="150"></div>
-      <div><label>Fecha del informe</label><input type="text" id="i-fecha" disabled></div>
-    </div>
-    <label>Observaciones generales de operatividad (retrasos, lags, fallas de transmisión…)</label>
-    <textarea id="t-informe_novedades" style="min-height:160px"></textarea>
-    <div style="margin-top:10px"><label>Firma del responsable</label>
-      <input type="text" id="i-firma" disabled></div>
-    <p style="font-size:12px;color:#777;margin:8px 0 0">La firma toma el nombre del responsable de turno.</p>
-  </div>
-  <div class="card"><h2>Descargar reporte del turno</h2>
-    <p style="font-size:12px;color:#777;margin:0 0 10px">El PDF sigue el formato oficial INJUL: datos del turno, resumen, bloque por sucursal con horas de inicio y fin, novedades, informe de turno y firma, de la fecha seleccionada.</p>
-    <div class="descargas">
-      <a class="btn rojo" id="dl-pdf" href="#">⬇ Descargar PDF oficial</a>
-      <a class="btn verde" id="dl-xlsx" href="#">⬇ Descargar Excel</a>
-    </div>
-  </div>
-  <div id="estado" class="estado" style="display:none"></div>
-</div>
-<script>
-var S = {fecha: "{{ fecha }}", d: null, sel: 0, pend: 0, ahora: ""};
-var CAMPOS = ["dia_rotacion","desde","hasta","ubicacion_sistema","responsable","area","informe_novedades"];
-function $(id){ return document.getElementById(id); }
-function el(tag, props, kids){
-  var e = document.createElement(tag);
-  for (var k in (props||{})) { if (k === "text") e.textContent = props[k]; else if (k === "cls") e.className = props[k]; else e[k] = props[k]; }
-  (kids||[]).forEach(function(c){ e.appendChild(c); });
-  return e;
-}
-function aviso(txt, clase){
-  var b = $("estado"); b.style.display = "block"; b.className = "estado " + (clase||""); b.textContent = txt;
-  if (clase === "ok") { setTimeout(function(){ if (S.pend === 0 && b.className.indexOf("ok") > -1) b.style.display = "none"; }, 1500); }
-}
-function post(url, body){
-  S.pend++; aviso("Guardando…");
-  return fetch(url, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)})
-    .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
-    .then(function(res){
-      S.pend--;
-      if (!res.ok || !res.j.ok) throw new Error(res.j.error || "Error");
-      aviso("Guardado ✓", "ok"); return res.j;
-    }).catch(function(e){ S.pend--; aviso("NO guardado: " + e.message + " — reintenta", "error"); throw e; });
-}
-function debounce(fn, ms){ var t; var f = function(){ clearTimeout(t); t = setTimeout(fn, ms); }; f.flush = function(){ clearTimeout(t); fn(); }; return f; }
-
-function cargar(){
-  fetch("/ciclico/api/estado?fecha=" + S.fecha).then(function(r){ return r.json(); }).then(function(j){
-    if (!j.ok) { aviso(j.error || "Error al cargar", "error"); return; }
-    S.d = j; S.ahora = j.ahora;
-    CAMPOS.forEach(function(c){ $("t-" + c).value = j.turno[c] || ""; });
-    $("i-fecha").value = S.fecha.split("-").reverse().join("/");
-    $("i-firma").value = j.turno.responsable || "";
-    $("lnk-aud").href = "/ciclico/auditoria?fecha=" + S.fecha;
-    var sel = $("sel-suc"); sel.innerHTML = "";
-    j.sitios.forEach(function(s, i){ sel.appendChild(el("option", {value: i, text: s.sucursal})); });
-    sel.value = Math.min(S.sel, j.sitios.length - 1);
-    pintarResumen(); pintarPanel();
-  }).catch(function(){ aviso("No se pudo cargar el turno", "error"); });
-}
-
-function pintarResumen(){
-  var tb = $("resumen"); tb.innerHTML = "";
-  S.d.sitios.forEach(function(s, i){
-    var completo = s.cuota_cumplida;
-    var tr = el("tr", {cls: completo ? "hecho" : ""}, [
-      el("td", {text: s.sucursal + (s.total_sede ? " (" + s.total_sede + " cám.)" : "")}), el("td", {text: s.total}),
-      el("td", {cls: completo ? "ok" : (s.revisadas ? "pend" : ""), text: s.revisadas + " / " + s.total + (completo ? " ✓" : "")}),
-      el("td", {text: s.hora_inicio || "—"}), el("td", {text: s.hora_fin || "—"}),
-      el("td", {text: s.novedades ? "Sí" : "s/n"})]);
-    tr.style.cursor = "pointer";
-    tr.onclick = function(){ S.sel = i; $("sel-suc").value = i; pintarPanel(); };
-    tb.appendChild(tr);
-  });
-}
-
-function reemplazarSitio(sitio){
-  for (var i = 0; i < S.d.sitios.length; i++) if (S.d.sitios[i].sucursal === sitio.sucursal) {
-    var nov = S.d.sitios[i].novedades;   // las novedades en edición no se pisan
-    S.d.sitios[i] = sitio; sitio.novedades = nov;
-  }
-  pintarResumen();
-  if (S.d.sitios[S.sel].sucursal === sitio.sucursal) pintarChecklist();
-}
-
-function guardarCamara(s, c, extra){
-  var body = {fecha: S.fecha, sucursal: s.sucursal, idx: c.idx};
-  for (var k in extra) body[k] = extra[k];
-  return post("/ciclico/api/camara", body).then(function(j){ reemplazarSitio(j.sitio); })
-    .catch(function(){ pintarChecklist(); });
-}
-function sitioVigente(nombre){
-  for (var i = 0; i < S.d.sitios.length; i++) if (S.d.sitios[i].sucursal === nombre) return S.d.sitios[i];
-}
-function guardarSitio(s, extra){
-  var body = {fecha: S.fecha, sucursal: s.sucursal};
-  for (var k in extra) body[k] = extra[k];
-  return post("/ciclico/api/sitio", body).then(function(j){
-    if (!("novedades" in extra)) reemplazarSitio(j.sitio);
-    else pintarResumen();
-  });
-}
-
-function pintarPanel(){
-  var s = S.d.sitios[S.sel], p = $("panel"); p.innerHTML = "";
-  var ini = el("input", {type:"time", value: s.hora_inicio || "", id:"s-ini"});
-  var fin = el("input", {type:"time", value: s.hora_fin || "", id:"s-fin"});
-  ini.onchange = function(){ guardarSitio(s, {hora_inicio: ini.value}); };
-  fin.onchange = function(){ guardarSitio(s, {hora_fin: fin.value}); };
-  var bIni = el("button", {cls:"btn chico verde", text:"▶ Iniciar ahora", type:"button"});
-  bIni.onclick = function(){ guardarSitio(s, {hora_inicio: "now"}); };
-  var bFin = el("button", {cls:"btn chico", text:"■ Finalizar ahora", type:"button"});
-  bFin.onclick = function(){ guardarSitio(s, {hora_fin: "now"}); };
-  p.appendChild(el("div", {cls:"tiempos"}, [
-    el("div", {}, [el("label", {text:"Hora de inicio"}), ini]), bIni,
-    el("div", {}, [el("label", {text:"Hora de fin"}), fin]), bFin]));
-  var rot = el("div", {cls:"rotinfo"});
-  rot.appendChild(document.createTextNode(s.rota
-    ? "Rotación diaria: hoy tocan " + s.total + " cámaras (sin repetir las de los últimos 6 días y sin las marcadas «No visible»). Pool de la sede: " + s.pool_total + ". Cambia cualquiera con ⇄. "
-    : "Bloque oficial de " + s.total + " cámaras (esta sede no tiene más cámaras en rotación). Puedes cambiar un cuadro con ⇄. "));
-  var bRest = el("button", {cls:"btn chico gris", type:"button", text:"↺ Restablecer rotación del día"});
-  bRest.onclick = function(){
-    post("/ciclico/api/plan/restablecer", {fecha: S.fecha, sucursal: s.sucursal}).then(function(j){ reemplazarSitio(j.sitio); }).catch(function(){});
-  };
-  rot.appendChild(bRest);
-  p.appendChild(rot);
-  p.appendChild(el("div", {id:"prog-txt", style:"font-size:13px;font-weight:bold;color:#0f3a63"}));
-  p.appendChild(el("div", {cls:"barra"}, [el("div", {id:"prog-bar"})]));
-  var ver = el("label", {style:"text-transform:none;font-size:13px;font-weight:normal;margin-bottom:8px"});
-  var chk = el("input", {type:"checkbox", id:"solo-pend"}); chk.onchange = pintarChecklist;
-  ver.appendChild(chk); ver.appendChild(document.createTextNode(" Mostrar sólo pendientes"));
-  p.appendChild(ver);
-  p.appendChild(el("div", {id:"lista"}));
-  p.appendChild(el("label", {text:"Novedades y acciones tomadas — " + s.sucursal, style:"margin-top:12px"}));
-  var ta = el("textarea", {id:"s-nov", placeholder:"Escriba aquí cualquier anomalía (vacío = sin novedad)", value: s.novedades || ""});
-  var guardarNov = debounce(function(){ guardarSitio(s, {novedades: ta.value}); }, 800);
-  ta.oninput = function(){ sitioVigente(s.sucursal).novedades = ta.value.trim(); guardarNov(); }; ta.onblur = function(){ guardarNov.flush(); };
-  p.appendChild(ta);
-  pintarChecklist();
-}
-
-function pintarChecklist(){
-  var s = S.d.sitios[S.sel], lista = $("lista"); if (!lista) return;
-  $("s-ini").value = s.hora_inicio || ""; $("s-fin").value = s.hora_fin || "";
-  $("prog-txt").textContent = "Cámaras revisadas: " + s.revisadas + " de " + s.total;
-  $("prog-bar").style.width = (s.total ? 100 * s.revisadas / s.total : 0) + "%";
-  var soloPend = $("solo-pend").checked;
-  lista.innerHTML = "";
-  lista.appendChild(el("div", {cls:"cam cab"}, [el("span"), el("span", {text:"Cámara (EZStation)"}), el("span", {text:"Inicio"}), el("span", {text:"Fin"}), el("span")]));
-  var nCiclos = s.total > 5 ? 2 : 1;
-  s.camaras.forEach(function(c){
-    if (nCiclos === 2 && (c.idx === 0 || c.idx === 5)) {
-      var arriba = c.idx === 0;
-      var ini = arriba ? 0 : 5, hecho = 0;
-      for (var k = ini; k < ini + 5 && k < s.camaras.length; k++) if (s.camaras[k].revisada) hecho++;
-      lista.appendChild(el("div", {cls:"cam cab", style:"background:#eef2f7;border-radius:4px;grid-template-columns:1fr"},
-        [el("span", {text: (arriba ? "Ciclo 1 · parte superior (cámaras 1–5)" : "Ciclo 2 · parte inferior (cámaras 6–10)") + " — " + hecho + " / 5"})]));
-    }
-    if (soloPend && c.revisada) return;
-    var cb = el("input", {type:"checkbox", checked: c.revisada});
-    cb.onchange = function(){ guardarCamara(s, c, {revisada: cb.checked}); };
-    var ci = el("input", {type:"time", value: c.hora_inicio || ""});
-    ci.onchange = function(){ guardarCamara(s, c, {hora_inicio: ci.value}); };
-    var cf = el("input", {type:"time", value: c.hora_fin || ""});
-    cf.onchange = function(){ guardarCamara(s, c, {hora_fin: cf.value}); };
-    var cmb = el("button", {cls:"btn chico gris cmb", type:"button", text:"⇄", title: c.revisada ? "Desmarca la cámara para cambiarla" : "Cambiar esta cámara"});
-    cmb.disabled = c.revisada;
-    var fila = el("div", {cls:"cam" + (c.revisada ? " hecho" : "")}, [cb, el("span", {cls:"nom", text:c.nombre}), ci, cf, cmb]);
-    cmb.onclick = function(){ abrirCambio(s, c, fila); };
-    lista.appendChild(fila);
-  });
-}
-
-function abrirCambio(s, c, fila){
-  var sig = fila.nextSibling;
-  if (sig && sig.className === "cambio") { sig.parentNode.removeChild(sig); return; }
-  var caja = el("div", {cls:"cambio"});
-  var q = el("input", {type:"text", placeholder:"Buscar o escribir la cámara que toca en " + s.sucursal + "…"});
-  var res = el("div", {cls:"res"});
-  var libre = el("button", {cls:"btn chico", type:"button", text:"Usar el texto escrito", style:"margin-top:6px"});
-  function elegir(nombre){
-    post("/ciclico/api/plan", {fecha: S.fecha, sucursal: s.sucursal, idx: c.idx, camara: nombre})
-      .then(function(j){ reemplazarSitio(j.sitio); }).catch(function(){});
-  }
-  function buscar(){
-    fetch("/ciclico/api/pool?fecha=" + S.fecha + "&sucursal=" + encodeURIComponent(s.sucursal) + "&q=" + encodeURIComponent(q.value))
-      .then(function(r){ return r.json(); }).then(function(j){
-        res.innerHTML = "";
-        if (!j.ok || !j.items.length) { res.appendChild(el("div", {cls:"vacio", text:"Sin coincidencias"})); return; }
-        j.items.forEach(function(it){
-          var o = el("div", {cls:"opc" + (it.en_plan ? " usada" : ""), text: it.nombre + (it.en_plan ? "  (ya está en el bloque)" : "") + (it.no_visible ? "  ⚠ No visible" : "")});
-          if (!it.en_plan) o.onclick = function(){ elegir(it.nombre); };
-          res.appendChild(o);
-        });
-      });
-  }
-  q.oninput = debounce(buscar, 250);
-  libre.onclick = function(){ if (q.value.trim()) elegir(q.value.trim()); };
-  caja.appendChild(q); caja.appendChild(res); caja.appendChild(libre);
-  fila.parentNode.insertBefore(caja, fila.nextSibling);
-  buscar(); q.focus();
-}
-
-function enlazarDescargas(){
-  [["dl-pdf","descargar-pdf"],["dl-xlsx","descargar-excel"],["dl-pdf-top","descargar-pdf"],["dl-xlsx-top","descargar-excel"]].forEach(function(par){
-    var a = $(par[0]), base = "/ciclico/" + par[1] + "?fecha=" + S.fecha;
-    var armar = function(){ return base; };
-    a.href = armar();
-    a.onclick = function(ev){
-      ev.preventDefault();
-      var url = armar();
-      if (a.classList.contains("cargando")) return;
-      a.classList.add("cargando");
-      var texto = a.textContent; a.textContent = "Preparando…";
-      var t0 = Date.now();
-      // Si hay cambios sin terminar de guardar, se espera (máx. 8 s) para que el reporte salga completo.
-      var espera = setInterval(function(){
-        if (S.pend === 0 || Date.now() - t0 > 8000) {
-          clearInterval(espera);
-          window.location.href = url;
-          setTimeout(function(){ a.classList.remove("cargando"); a.textContent = texto; }, 2500);
-        }
-      }, 150);
-    };
-  });
-}
-function enlazarTurno(){
-  CAMPOS.forEach(function(c){
-    var inp = $("t-" + c);
-    var enviar = function(){
-      var b = {fecha: S.fecha}; b[c] = inp.value;
-      post("/ciclico/api/turno", b).then(function(j){
-        if (c === "responsable") $("i-firma").value = inp.value;
-      });
-    };
-    if (inp.tagName === "TEXTAREA") {
-      var d = debounce(enviar, 800); inp.oninput = d; inp.onblur = function(){ d.flush(); };
-    } else { inp.onchange = enviar; }
-  });
-  $("f-fecha").onchange = function(){
-    if (!this.value) return;
-    window.location.href = "/ciclico/?fecha=" + this.value;
-  };
-  function moverDia(d){
-    var p = S.fecha.split("-"), t = new Date(Date.UTC(+p[0], +p[1] - 1, +p[2] + d));
-    window.location.href = "/ciclico/?fecha=" + t.toISOString().slice(0, 10);
-  }
-  $("f-ant").onclick = function(){ moverDia(-1); };
-  $("f-sig").onclick = function(){ moverDia(1); };
-  $("sel-suc").onchange = function(){ S.sel = parseInt(this.value, 10); pintarPanel(); };
-  window.addEventListener("beforeunload", function(e){ if (S.pend > 0) { e.preventDefault(); e.returnValue = ""; } });
-}
-enlazarTurno(); enlazarDescargas(); cargar();
-</script></body></html>
-"""
-
-HISTORIAL = """<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>INJUL - Historial cíclico</title>%%ESTILO%%</head><body><div class="wrap">
-  <div class="banner"><h1>HISTORIAL DE TURNOS CÍCLICOS</h1><p>INJUL · Plan de Monitoreo Tiempo Real Cíclico Diario</p></div>
-  <div class="nav"><a class="btn" href="/ciclico/">← Turno de hoy</a><a class="btn gris" href="/">Consolidado CCTV</a></div>
-  <div class="card">
-  {% if error %}<div class="vacio">{{ error }}</div>
-  {% elif not filas %}<div class="vacio">Aún no hay turnos registrados.</div>
-  {% else %}
-  <div style="overflow-x:auto"><table>
-    <tr><th>Fecha</th><th>Día</th><th>Responsable</th><th>Horario</th><th>Cámaras revisadas</th>
-        <th>Sucursales con novedad</th><th>Informe</th><th></th></tr>
-    {% for f in filas %}<tr>
-      <td>{{ f[0].strftime('%d/%m/%Y') }}</td><td>{{ f[1] }}</td><td>{{ f[2] or '—' }}</td>
-      <td>{{ f[3] or '—' }} – {{ f[4] or '—' }}</td>
-      <td class="{{ 'ok' if f[5] >= total else 'pend' }}">{{ f[5] }} / {{ total }}</td>
-      <td>{{ f[6] }}</td><td>{{ 'Sí' if f[7] else '—' }}</td>
-      <td><a href="/ciclico/?fecha={{ f[0].isoformat() }}">Abrir</a> ·
-          <a href="/ciclico/auditoria?fecha={{ f[0].isoformat() }}">Auditoría</a> ·
-          <a href="/ciclico/descargar-pdf?fecha={{ f[0].isoformat() }}">PDF</a> ·
-          <a href="/ciclico/descargar-excel?fecha={{ f[0].isoformat() }}">Excel</a></td>
-    </tr>{% endfor %}
-  </table></div>{% endif %}
-  </div></div></body></html>
-"""
-
-AUDITORIA = """<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>INJUL - Auditoría cíclica</title>%%ESTILO%%</head><body><div class="wrap">
-  <div class="banner"><h1>AUDITORÍA DEL TURNO {{ fecha }}</h1><p>Cada cambio registrado, con hora y origen</p></div>
-  <div class="nav"><a class="btn" href="/ciclico/?fecha={{ fecha }}">← Volver al turno</a>
-    <a class="btn gris" href="/ciclico/historial">Historial</a></div>
-  <div class="card">
-  {% if error %}<div class="vacio">{{ error }}</div>
-  {% elif not filas %}<div class="vacio">Sin cambios registrados para esta fecha.</div>
-  {% else %}
-  <div style="overflow-x:auto"><table>
-    <tr><th>Cuándo</th><th>Sucursal</th><th>Cámara</th><th>Campo</th><th>Antes</th><th>Después</th><th>Origen</th></tr>
-    {% for f in filas %}<tr><td>{{ f[0] }}</td><td>{{ f[1] or '—' }}</td><td>{{ f[2] or '—' }}</td>
-      <td>{{ f[3] }}</td><td>{{ f[4] }}</td><td>{{ f[5] }}</td><td>{{ f[6] }}</td></tr>{% endfor %}
-  </table></div>{% endif %}
-  </div></div></body></html>
-"""
-
-
-PAGINA = PAGINA.replace("%%ESTILO%%", ESTILO)
-HISTORIAL = HISTORIAL.replace("%%ESTILO%%", ESTILO)
-AUDITORIA = AUDITORIA.replace("%%ESTILO%%", ESTILO)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
