@@ -1,0 +1,61 @@
+@app.route("/api/camara", methods=["POST"])
+def api_camara():
+    datos_in = request.get_json(silent=True) or {}
+    sucursal = datos_in.get("sucursal")
+    estado = datos_in.get("estado")
+    en_vivo = str(datos_in.get("en_vivo") or "Sí")
+    grabacion = str(datos_in.get("grabacion") or "Normal")
+    observacion = str(datos_in.get("observacion") or "").strip()[:500]
+    idx = datos_in.get("idx")
+
+    if sucursal not in CATALOGO_CAMARAS:
+        return jsonify(ok=False, error="Sucursal no válida"), 400
+    if not isinstance(idx, int) or isinstance(idx, bool) or not 0 <= idx < len(CATALOGO_CAMARAS[sucursal]):
+        return jsonify(ok=False, error="Cámara no válida"), 400
+    if estado not in ESTADOS_VALIDOS:
+        return jsonify(ok=False, error="Estado no válido"), 400
+    if not DATABASE_URL:
+        return jsonify(ok=False, error="Base de datos no configurada"), 503
+
+    camara = CATALOGO_CAMARAS[sucursal][idx]
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                """
+                SELECT estado, observacion FROM estado_camaras_actual
+                WHERE sucursal = %s AND camara = %s FOR UPDATE
+                """,
+                (sucursal, camara),
+            )
+            previo = cur.fetchone()
+            est_ant = previo[0] if previo else None
+            obs_ant = (previo[1] or "") if previo else None
+            cambiado = previo is None or est_ant != estado or obs_ant != observacion
+            if cambiado:
+                cur.execute(
+                    """
+                    INSERT INTO estado_camaras_actual (sucursal, camara, estado, observacion, actualizado_en)
+                    VALUES (%s, %s, %s, %s, NOW())
+                    ON CONFLICT (sucursal, camara) DO UPDATE
+                    SET estado = EXCLUDED.estado,
+                        observacion = EXCLUDED.observacion,
+                        actualizado_en = NOW()
+                    """,
+                    (sucursal, camara, estado, observacion),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO historial_cctv
+                        (sucursal, camara, estado_anterior, estado_nuevo,
+                         observacion_anterior, observacion_nueva, origen)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (sucursal, camara, est_ant, estado, obs_ant, observacion, ip_cliente()),
+                )
+    except Exception:
+        logger.exception("Error guardando cámara")
+        return jsonify(ok=False, error="No se pudo guardar"), 500
+
+    cache_invalidar()
+    datos = cargar_datos()
+    return jsonify(ok=True, cambiado=cambiado, resumen=resumen_dict(datos["detalles"]))
