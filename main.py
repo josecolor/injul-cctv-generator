@@ -277,7 +277,7 @@ def inicializar_base_de_datos():
                     sucursal VARCHAR(100) NOT NULL,
                     camara VARCHAR(150) NOT NULL,
                     estado VARCHAR(50) NOT NULL,
-                    en_vivo VARCHAR(20) NOT NULL DEFAULT 'Sí',
+                    en_vivo VARCHAR(20) NOT NULL DEFAULT '',
                     grabacion VARCHAR(30) NOT NULL DEFAULT 'Normal',
                     observacion TEXT NOT NULL DEFAULT '',
                     actualizado_en TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -295,6 +295,8 @@ def inicializar_base_de_datos():
                     origen VARCHAR(60)
                 );
             """)
+            cur.execute("ALTER TABLE estado_camaras_actual ADD COLUMN IF NOT EXISTS en_vivo VARCHAR(20) NOT NULL DEFAULT '';")
+            cur.execute("ALTER TABLE estado_camaras_actual ADD COLUMN IF NOT EXISTS grabacion VARCHAR(30) NOT NULL DEFAULT 'Normal';")
     except Exception:
         logger.exception("Error inicializando BD")
 
@@ -366,104 +368,6 @@ def resumen_total(detalles):
 def resumen_dict(detalles):
     total, op, nv, pv, disp = resumen_total(detalles)
     return {"total": total, "operativas": op, "no_visibles": nv, "por_verificar": pv, "disponibilidad": disp}
-
-def nivel(disp):
-    if disp >= 90: return "Óptimo"
-    if disp >= 60: return "Atención"
-    return "Crítico"
-
-class NumberedCanvas(canvas.Canvas):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._saved_page_states = []
-    def showPage(self):
-        self._saved_page_states.append(dict(self.__dict__))
-        self._startPage()
-    def save(self):
-        num_pages = len(self._saved_page_states)
-        for state in self._saved_page_states:
-            self.__dict__.update(state)
-            self.draw_watermark_and_footer(num_pages)
-            super().showPage()
-        super().save()
-    def draw_watermark_and_footer(self, total_pages):
-        self.saveState()
-        self.setFont("Helvetica-Bold", 60)
-        self.setFillColor(colors.HexColor("#F2DEDE"), alpha=0.3)
-        self.translate(300, 400)
-        self.rotate(45)
-        self.drawCentredString(0, 0, "CONFIDENCIAL")
-        self.restoreState()
-        self.saveState()
-        self.setFont("Helvetica", 9)
-        self.setFillColor(colors.HexColor("#555555"))
-        self.drawString(36, 25, "INJUL - Consolidado Maestro de CCTV")
-        self.drawCentredString(letter[0] / 2, 25, f"Página {self._pageNumber} de {total_pages}")
-        self.drawRightString(letter[0] - 36, 25, "Documento confidencial")
-        self.setStrokeColor(colors.HexColor("#CCCCCC"))
-        self.setLineWidth(0.5)
-        self.line(36, 38, letter[0] - 36, 38)
-        self.restoreState()
-
-COLOR_ESTADO = {"Operativa": "#DFF0D8", "No visible": "#F2DEDE", "Por verificar": "#FCF8E3"}
-COLOR_NIVEL = {"Óptimo": "#DFF0D8", "Atención": "#FCF8E3", "Crítico": "#F2DEDE"}
-
-def estilo_tabla(color_cabecera, extra=None):
-    comandos = [
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(color_cabecera)),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 8),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
-    ]
-    if extra: comandos.extend(extra)
-    return TableStyle(comandos)
-
-EN_VIVO_OFICIAL = {"sí": "Sí", "si": "Sí", "no": "No", "intermitente": "Intermitente"}
-GRABACION_OFICIAL = {"normal": "Normal", "por movimiento": "Por movimiento", "no graba": "No graba"}
-COLOR_TEXTO_EN_VIVO = {"Sí": "#2E7D32", "No": "#C62828", "Intermitente": "#B26A00", "—": "#888888"}
-COLOR_TEXTO_GRABACION = {"Normal": "#333333", "Por movimiento": "#333333", "No graba": "#C62828"}
-
-def _valor_columna(info, claves, oficial):
-    for clave in claves:
-        crudo = info.get(clave)
-        if not crudo: continue
-        val = oficial.get(str(crudo).strip().lower())
-        if val: return val
-    return "—"
-
-def _celda_color(texto, colores, estilo):
-    color = colores.get(texto, "#888888")
-    if texto == "—":
-        return Paragraph(f"<font color='{color}'>—</font>", estilo)
-    if color == "#333333":
-        return Paragraph(esc(texto), estilo)
-    return Paragraph(f"<font color='{color}'><b>{esc(texto)}</b></font>", estilo)
-
-def filas_detalle_sucursal(detalles, suc, camaras, estilos):
-    celda_izq, celda_cen = estilos
-    filas = [["#", "Ubicación / Nombre en EZStation", "En vivo", "Grabación", "Estado", "Observaciones"]]
-    extra = []
-    for n, cam in enumerate(camaras, start=1):
-        info = detalles.get(suc, {}).get(cam) or {}
-        est = info.get("estado") or "Por verificar"
-        if est not in COLOR_ESTADO: est = "Por verificar"
-        obs = str(info.get("observacion") or "").strip()
-        en_vivo = _valor_columna(info, ("en_vivo", "envivo"), EN_VIVO_OFICIAL)
-        grab = _valor_columna(info, ("grabacion", "grabación"), GRABACION_OFICIAL)
-        fila = [
-            str(n),
-            Paragraph(esc(cam), celda_izq),
-            _celda_color(en_vivo, COLOR_TEXTO_EN_VIVO, celda_cen),
-            _celda_color(grab, COLOR_TEXTO_GRABACION, celda_cen),
-            _celda_color(est, {"Operativa": "#2E7D32", "No visible": "#C62828", "Por verificar": "#B26A00"}, celda_cen),
-            Paragraph(esc(obs), celda_izq),
-        ]
-        filas.append(fila)
-        extra.append(("BACKGROUND", (4, n), (4, n), colors.HexColor(COLOR_ESTADO[est])))
-    return filas, extra
 
 @app.route("/health")
 def health():
@@ -560,15 +464,6 @@ def historial():
     filtro = request.args.get("sucursal") or ""
     if filtro not in CATALOGO_CAMARAS: filtro = ""
     return render_template("historial.html", filas=cargar_historial(200, filtro or None), catalogo=CATALOGO_CAMARAS, filtro=filtro)
-
-@app.route("/descargar-pdf")
-def descargar_pdf():
-    # Nota: Aquí puedes usar tu función de PDF o la estándar que ya teníamos
-    return "PDF en mantenimiento", 200
-
-@app.route("/descargar-excel")
-def descargar_excel():
-    return "Excel en mantenimiento", 200
 
 try:
     import ciclico
