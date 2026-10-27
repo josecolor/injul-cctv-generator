@@ -6,7 +6,7 @@
     <title>INJUL - Consolidado CCTV</title>
     <style>
         body { font-family: Arial, sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 15px; }
-        .container { max-width: 950px; margin: 0 auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+        .container { max-width: 1050px; margin: 0 auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
         h1 { color: #1F497D; font-size: 20px; border-bottom: 2px solid #1F497D; padding-bottom: 8px; }
         h3 { color: #1F497D; margin-top: 5px; }
         .card { background: #f8f9fa; padding: 15px; margin-bottom: 15px; border-radius: 6px; border-left: 4px solid #1F497D; }
@@ -17,14 +17,14 @@
         .btn:hover { opacity: 0.9; }
         .form-group { margin-bottom: 10px; }
         label { display: block; font-weight: bold; font-size: 13px; margin-bottom: 3px; color: #444; }
-        input, select, textarea { width: 100%; padding: 8px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
+        input, select, textarea { width: 100%; padding: 6px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
         table { width: 100%; border-collapse: collapse; margin-top: 15px; }
-        th, td { border: 1px solid #ddd; padding: 8px; text-align: center; font-size: 12px; }
+        th, td { border: 1px solid #ddd; padding: 6px; text-align: center; font-size: 11px; }
         th { background-color: #1F497D; color: white; }
         .estado-op td.celda-estado { background: #dff0d8; }
         .estado-nv td.celda-estado { background: #f2dede; }
         .estado-pv td.celda-estado { background: #fcf8e3; }
-        .marca { font-size: 11px; color: #777; white-space: nowrap; min-width: 80px; }
+        .marca { font-size: 11px; color: #777; white-space: nowrap; min-width: 70px; }
         .marca.ok { color: #2d6a2d; }
         .marca.error { color: #a94442; font-weight: bold; }
         .aviso { padding: 10px 14px; border-radius: 4px; margin-bottom: 15px; font-size: 14px; }
@@ -57,14 +57,25 @@
 
         function guardarFila(tr) {
             var marca = tr.querySelector('.marca');
-            var estado = tr.querySelector('select').value;
-            var obs = tr.querySelector('input').value;
+            var estado = tr.querySelector('.select-estado').value;
+            var en_vivo = tr.querySelector('.select-envivo').value;
+            var grabacion = tr.querySelector('.select-grab').value;
+            var obs = tr.querySelector('.input-obs').value;
+
             marca.className = 'marca';
             marca.textContent = 'Guardando...';
+
             fetch('/api/camara', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({sucursal: tr.dataset.suc, idx: parseInt(tr.dataset.idx, 10), estado: estado, observacion: obs})
+                body: JSON.stringify({
+                    sucursal: tr.dataset.suc,
+                    idx: parseInt(tr.dataset.idx, 10),
+                    estado: estado,
+                    en_vivo: en_vivo,
+                    grabacion: grabacion,
+                    observacion: obs
+                })
             }).then(function (resp) {
                 return resp.json().then(function (j) { return {ok: resp.ok, j: j}; });
             }).then(function (res) {
@@ -84,8 +95,10 @@
             var filas = document.querySelectorAll('tr.camera-row');
             for (var i = 0; i < filas.length; i++) {
                 (function (tr) {
-                    tr.querySelector('select').addEventListener('change', function () { guardarFila(tr); });
-                    tr.querySelector('input').addEventListener('change', function () { guardarFila(tr); });
+                    tr.querySelector('.select-estado').addEventListener('change', function () { guardarFila(tr); });
+                    tr.querySelector('.select-envivo').addEventListener('change', function () { guardarFila(tr); });
+                    tr.querySelector('.select-grab').addEventListener('change', function () { guardarFila(tr); });
+                    tr.querySelector('.input-obs').addEventListener('change', function () { guardarFila(tr); });
                 })(filas[i]);
             }
         };
@@ -109,7 +122,7 @@
         <div class="card">
             <h3>Seleccionar Sucursal y Revisar Cámaras</h3>
             <p style="font-size: 12px; color: #666; margin-top: 0;">
-                Cada cambio de estado u observación se guarda al instante y queda registrado en el historial.
+                Cada cambio de estado, en vivo, grabación u observación se guarda al instante.
             </p>
             <div class="form-group">
                 <label>Sucursal:</label>
@@ -128,7 +141,9 @@
                 <table>
                     <tr>
                         <th>#</th>
-                        <th>Nombre de la Cámara (EZStation)</th>
+                        <th>Cámara (EZStation)</th>
+                        <th>En vivo</th>
+                        <th>Grabación</th>
                         <th>Estado</th>
                         <th>Observación</th>
                         <th></th>
@@ -136,18 +151,34 @@
                     {% for cam in camaras %}
                     {% set info = guardado.get(cam, {}) %}
                     {% set est = info.get('estado') or 'Por verificar' %}
+                    {% set env = info.get('en_vivo') or 'Sí' %}
+                    {% set grb = info.get('grabacion') or 'Normal' %}
                     <tr class="camera-row {{ clases[est] }}" data-suc="{{ suc }}" data-idx="{{ loop.index0 }}">
                         <td>{{ loop.index }}</td>
                         <td style="text-align: left; font-weight: bold;">{{ cam }}</td>
+                        <td>
+                            <select class="select-envivo" style="padding: 3px;">
+                                <option value="Sí" {% if env == 'Sí' %}selected{% endif %}>Sí</option>
+                                <option value="No" {% if env == 'No' %}selected{% endif %}>No</option>
+                                <option value="Intermitente" {% if env == 'Intermitente' %}selected{% endif %}>Intermitente</option>
+                            </select>
+                        </td>
+                        <td>
+                            <select class="select-grab" style="padding: 3px;">
+                                <option value="Normal" {% if grb == 'Normal' %}selected{% endif %}>Normal</option>
+                                <option value="Por movimiento" {% if grb == 'Por movimiento' %}selected{% endif %}>Por movimiento</option>
+                                <option value="No graba" {% if grb == 'No graba' %}selected{% endif %}>No graba</option>
+                            </select>
+                        </td>
                         <td class="celda-estado">
-                            <select style="padding: 4px;">
+                            <select class="select-estado" style="padding: 3px;">
                                 {% for valor, texto in estados %}
                                 <option value="{{ valor }}" {% if est == valor %}selected{% endif %}>{{ texto }}</option>
                                 {% endfor %}
                             </select>
                         </td>
                         <td>
-                            <input type="text" value="{{ info.get('observacion', '') }}" maxlength="500" placeholder="Detalle si falla..." style="padding: 4px;">
+                            <input type="text" class="input-obs" value="{{ info.get('observacion', '') }}" maxlength="500" placeholder="Detalle..." style="padding: 3px;">
                         </td>
                         <td class="marca"></td>
                     </tr>
@@ -181,7 +212,7 @@
                     <input type="number" name="dias_abiertos" value="0" min="0" placeholder="Ej: 5">
                 </div>
                 <div class="form-group">
-                    <label>Detalle del Reporte (Información de lo que pasó):</label>
+                    <label>Detalle del Reporte:</label>
                     <textarea name="detalle" rows="2" placeholder="Ej: Problemas de visualización..."></textarea>
                 </div>
                 <button type="submit" class="btn btn-ticket">📝 Registrar Ticket</button>
