@@ -46,8 +46,10 @@ try:
     from zoneinfo import ZoneInfo
 
     ZONA_HORARIA = ZoneInfo("America/Santo_Domingo")
-except Exception:  # noqa: BLE001 - si falta tzdata se usa la hora del servidor
-    ZONA_HORARIA = None
+except Exception:  # noqa: BLE001 - si falta tzdata se usa UTC-4 fijo (RD no tiene horario de verano)
+    from datetime import timedelta, timezone
+
+    ZONA_HORARIA = timezone(timedelta(hours=-4), "AST")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("injul-cctv")
@@ -151,6 +153,59 @@ CATALOGO_CAMARAS = {
         "IP Camera 13", "IP Camera 14", "IP Camera 15", "IP Camera 16",
     ],
 }
+# --- CATÁLOGO OFICIAL DEL MONITOREO CÍCLICO (formato institucional INJUL) ---
+# Es la cuota operativa que un operador audita por turno (5 a 10 cámaras clave por
+# sede), NO el chequeo masivo de todas las cámaras (eso es CATALOGO_CAMARAS).
+# El orden y la cantidad de cuadros de cada sede replican el PDF oficial: las sedes
+# grandes (San Cristóbal y DCM) llevan 10 cuadros (ciclo 1 = arriba, ciclo 2 = abajo);
+# el resto lleva 5. No agregar cámaras de más: rompe el formato.
+CATALOGO_CICLICO = {
+    "Sucursal San Cristóbal": [
+        "Entrada puerta 1 - entrada p1", "Área de diseño artech - artech02",
+        "Área de diseño artech 2 - artech01", "Pulidoras", "Pulidora 02",
+        "Carga almacén general - carga área 1 alm", "Carga almacén general 2",
+        "Entrada a fábrica puerta 3 - salida fábrica A",
+        "Garita punchado - puerta entrada G", "Calle principal puerta 2 - frente puerta",
+    ],
+    "Marmotech DCM": [
+        "IP Camera 30", "Frente de la puerta, utensilios - IP Camera 32",
+        "Parqueo de motores - IP Camera 34", "Terraza lado céntrico - IP Camera 36",
+        "IP Camera 38", "Parqueo sótano 1 - IP Camera 40",
+        "Pasillos de exhibidores parte céntrica - IP Camera 42", "IP Camera 44",
+        "IP Camera 46", "IP Camera 48",
+    ],
+    "Marmotech Santiago 1": [
+        "Calle frente a la empresa - IP Camera 02", "Parte trasera - IP Camera 04",
+        "Calle principal - IP Camera 06", "Mostrador - IP Camera 08",
+        "Almacén interior 2 - IP Camera 10",
+    ],
+    "Marmotech Santiago 2": [
+        "Mostrador - Muebles", "Cocina", "Parqueo principal - Parqueo 0-E", "Pisos",
+        "Parqueo E-O",
+    ],
+    "Marmotech Blue Mall": [
+        "Show 2da Planta", "Área 1ra Planta Puerta Trasera",
+        "Área 1ra Planta Puerta Trasera Norte", "Área Clientes 1ra Planta", "Gabinete TI",
+    ],
+    "Marmotech Outlet RP": [
+        "Parqueo lado derecho - IP Camera 10", "Parte atrás, compresores A/C - IP Camera 12",
+        "Almacén General - IP Camera 14", "Exhibidores de venta - IP Camera 16",
+        "Cámara escalera lado izquierdo - IP Camera 02",
+    ],
+    "Marmotech Punta Cana": [
+        "Área Trasera 1", "Área Trasera 5", "Área Trasera 4", "Área Gabinete Datos",
+        "Puerta Entrada Principal",
+    ],
+    "Marmotech Caribbean": [
+        "CB 6-7-8 Planta Eléctrica", "Taller Soldar", "Oficina Almacén Repuesto",
+        "Almacén Repuesto", "Taller Fabricación",
+    ],
+    "Caribbean Agregados": [
+        "Frente Lado desde Caribbean", "Lado Atrás esquina puerta", "Puerta lado norte",
+        "Frente hacia lado norte", "Oficina Gabinete data",
+    ],
+}
+
 ESTADOS = [
     ("Operativa", "Operativa (Sí)"),
     ("No visible", "No visible (Rojo)"),
@@ -1231,12 +1286,12 @@ def descargar_excel():
 
 
 # --- Módulo independiente: Plan de Monitoreo Cíclico y Novedades (/ciclico) ---
-# Tiene sus propias tablas (ciclico_*), rutas y bloques oficiales (ciclico.BLOQUES):
-# la cuota cíclica de 5-10 cámaras por sede NO sale de CATALOGO_CAMARAS.
+# Tiene sus propias tablas (ciclico_*) y rutas; sólo lee CATALOGO_CICLICO.
 import ciclico  # noqa: E402
 
 ciclico.registrar(
     app,
+    catalogo=CATALOGO_CICLICO,
     db_cursor=db_cursor,
     ahora=ahora,
     local_txt=local_txt,
