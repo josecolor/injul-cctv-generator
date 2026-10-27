@@ -181,4 +181,217 @@ CATALOGO_CICLICO = {
         "Show 2da Planta", "Área 1ra Planta Puerta Trasera",
         "Área 1ra Planta Puerta Trasera Norte", "Área Clientes 1ra Planta", "Gabinete TI",
     ],
-    "
+    "Marmotech Outlet RP": [
+        "Parqueo lado derecho - IP Camera 10", "Parte atrás, compresores A/C - IP Camera 12",
+        "Almacén General - IP Camera 14", "Exhibidores de venta - IP Camera 16",
+        "Cámara escalera lado izquierdo - IP Camera 02",
+    ],
+    "Marmotech Punta Cana": [
+        "Área Trasera 1", "Área Trasera 5", "Área Trasera 4", "Área Gabinete Datos",
+        "Puerta Entrada Principal",
+    ],
+    "Marmotech Caribbean": [
+        "CB 6-7-8 Planta Eléctrica", "Taller Soldar", "Oficina Almacén Repuesto",
+        "Almacén Repuesto", "Taller Fabricación",
+    ],
+    "Caribbean Agregados": [
+        "Frente Lado desde Caribbean", "Lado Atrás esquina puerta", "Puerta lado norte",
+        "Frente hacia lado norte", "Oficina Gabinete data",
+    ],
+}
+
+ANCLA_ROTACION = date(2026, 10, 24)
+
+INVENTARIO_DE = {
+    "Sucursal San Cristóbal": "Sucursal San Cristóbal",
+    "Marmotech DCM": "Marmotech DCM",
+    "Marmotech Santiago 1": "Marmotech Santiago 1",
+    "Marmotech Santiago 2": "Marmotech Santiago 2",
+    "Marmotech Blue Mall": "Marmotech Blue Mall",
+    "Marmotech Outlet RP": "Marmotech Outlet RP",
+    "Marmotech Punta Cana": "Marmotech Punta Cana",
+    "Caribbean Agregados": "Caribbean Agregados",
+}
+
+
+def _construir_pool(clave):
+    base = list(CATALOGO_CICLICO[clave])
+    vistos = {n.lower() for n in base}
+    nums = {m for n in base for m in re.findall(r"ip camera\s*0*(\d+)", n.lower())}
+    extra = []
+    for n in CATALOGO_CAMARAS.get(INVENTARIO_DE.get(clave, ""), []):
+        ip = re.findall(r"ip camera\s*0*(\d+)$", n.lower())
+        if n.lower() in vistos or (ip and ip[0] in nums):
+            continue
+        vistos.add(n.lower())
+        extra.append(n)
+    return base + extra
+
+
+POOL_CICLICO = {clave: _construir_pool(clave) for clave in CATALOGO_CICLICO}
+
+
+def camaras_no_visibles(cur, sucursal):
+    cur.execute(
+        "SELECT camara FROM estado_camaras_actual WHERE sucursal = %s AND estado = 'No visible'",
+        (sucursal,),
+    )
+    return {fila[0] for fila in cur.fetchall()}
+
+
+ESTADOS = [
+    ("Operativa", "Operativa (Sí)"),
+    ("No visible", "No visible (Rojo)"),
+    ("Por verificar", "Por verificar"),
+]
+ESTADOS_VALIDOS = {valor for valor, _ in ESTADOS}
+
+MENSAJES = {
+    "ticket_ok": ("ok", "Ticket registrado correctamente."),
+    "sin_db": ("error", "La base de datos no está configurada (falta DATABASE_URL)."),
+    "error": ("error", "No se pudo guardar. Revisa los registros en Railway."),
+}
+
+HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>INJUL - Consolidado CCTV</title>
+    <style>
+        body { font-family: Arial, sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 15px; }
+        .container { max-width: 950px; margin: 0 auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+        h1 { color: #1F497D; font-size: 20px; border-bottom: 2px solid #1F497D; padding-bottom: 8px; }
+        h3 { color: #1F497D; margin-top: 5px; }
+        .card { background: #f8f9fa; padding: 15px; margin-bottom: 15px; border-radius: 6px; border-left: 4px solid #1F497D; }
+        .btn { display: inline-block; background: #1F497D; color: white; padding: 10px 15px; text-decoration: none; border-radius: 4px; font-weight: bold; margin-top: 5px; margin-right: 5px; border: none; cursor: pointer; font-size: 14px; }
+        .btn-excel { background: #217346; }
+        .btn-ticket { background: #D9534F; }
+        .btn-gris { background: #6c757d; }
+        .btn:hover { opacity: 0.9; }
+        .form-group { margin-bottom: 10px; }
+        label { display: block; font-weight: bold; font-size: 13px; margin-bottom: 3px; color: #444; }
+        input, select, textarea { width: 100%; padding: 8px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: center; font-size: 12px; }
+        th { background-color: #1F497D; color: white; }
+        .estado-op td.celda-estado { background: #dff0d8; }
+        .estado-nv td.celda-estado { background: #f2dede; }
+        .estado-pv td.celda-estado { background: #fcf8e3; }
+        .marca { font-size: 11px; color: #777; white-space: nowrap; min-width: 80px; }
+        .marca.ok { color: #2d6a2d; }
+        .marca.error { color: #a94442; font-weight: bold; }
+        .aviso { padding: 10px 14px; border-radius: 4px; margin-bottom: 15px; font-size: 14px; }
+        .aviso.ok { background: #dff0d8; color: #2d6a2d; }
+        .aviso.error { background: #f2dede; color: #a94442; }
+        .kpis { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 15px; }
+        .kpi { flex: 1; min-width: 110px; background: #f8f9fa; border-top: 3px solid #1F497D; padding: 8px; text-align: center; }
+        .kpi b { display: block; font-size: 22px; color: #1F497D; }
+        .kpi span { font-size: 11px; color: #666; }
+        .tabla-scroll { overflow-x: auto; }
+    </style>
+    <script>
+        var CLASES = {'Operativa': 'estado-op', 'No visible': 'estado-nv', 'Por verificar': 'estado-pv'};
+
+        function mostrarSucursal() {
+            var select = document.getElementById('sucursal-select');
+            var listas = document.getElementsByClassName('lista-sucursal');
+            for (var i = 0; i < listas.length; i++) {
+                listas[i].style.display = (listas[i].id === 'sucursal-' + select.selectedIndex) ? 'block' : 'none';
+            }
+        }
+
+        function actualizarResumen(r) {
+            document.getElementById('k-total').textContent = r.total;
+            document.getElementById('k-op').textContent = r.operativas;
+            document.getElementById('k-nv').textContent = r.no_visibles;
+            document.getElementById('k-pv').textContent = r.por_verificar;
+            document.getElementById('k-disp').textContent = r.disponibilidad.toFixed(1) + '%';
+        }
+
+        function guardarFila(tr) {
+            var marca = tr.querySelector('.marca');
+            var estado = tr.querySelector('select').value;
+            var obs = tr.querySelector('input').value;
+            marca.className = 'marca';
+            marca.textContent = 'Guardando...';
+            fetch('/api/camara', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({sucursal: tr.dataset.suc, idx: parseInt(tr.dataset.idx, 10), estado: estado, observacion: obs})
+            }).then(function (resp) {
+                return resp.json().then(function (j) { return {ok: resp.ok, j: j}; });
+            }).then(function (res) {
+                if (!res.ok || !res.j.ok) { throw new Error(res.j.error || 'Error'); }
+                tr.className = 'camera-row ' + (CLASES[estado] || 'estado-pv');
+                marca.className = 'marca ok';
+                marca.textContent = res.j.cambiado ? 'Guardado ✓' : 'Sin cambios';
+                actualizarResumen(res.j.resumen);
+            }).catch(function () {
+                marca.className = 'marca error';
+                marca.textContent = 'NO guardado: reintenta';
+            });
+        }
+
+        window.onload = function () {
+            mostrarSucursal();
+            var filas = document.querySelectorAll('tr.camera-row');
+            for (var i = 0; i < filas.length; i++) {
+                (function (tr) {
+                    tr.querySelector('select').addEventListener('change', function () { guardarFila(tr); });
+                    tr.querySelector('input').addEventListener('change', function () { guardarFila(tr); });
+                })(filas[i]);
+            }
+        };
+    </script>
+</head>
+<body>
+    <div class="container">
+        <h1>INJUL - Sistema de Monitoreo CCTV</h1>
+        <p style="margin: 0 0 12px;"><a class="btn btn-gris" href="/ciclico/">Plan de Monitoreo Cíclico y Novedades →</a></p>
+
+        {% if mensaje %}<div class="aviso {{ tipo }}">{{ mensaje }}</div>{% endif %}
+
+        <div class="kpis">
+            <div class="kpi"><b id="k-total">{{ resumen.total }}</b><span>Cámaras</span></div>
+            <div class="kpi"><b id="k-op">{{ resumen.operativas }}</b><span>Operativas</span></div>
+            <div class="kpi"><b id="k-nv">{{ resumen.no_visibles }}</b><span>No visibles</span></div>
+            <div class="kpi"><b id="k-pv">{{ resumen.por_verificar }}</b><span>Por verificar</span></div>
+            <div class="kpi"><b id="k-disp">{{ '%.1f'|format(resumen.disponibilidad) }}%</b><span>Disponibilidad</span></div>
+        </div>
+
+        <div class="card">
+            <h3>Seleccionar Sucursal y Revisar Cámaras</h3>
+            <p style="font-size: 12px; color: #666; margin-top: 0;">
+                Cada cambio de estado u observación se guarda al instante y queda registrado en el historial.
+            </p>
+            <div class="form-group">
+                <label>Sucursal:</label>
+                <select id="sucursal-select" onchange="mostrarSucursal()">
+                    {% for suc in catalogo.keys() %}
+                    <option value="{{ suc }}" {% if loop.index0 == seleccion %}selected{% endif %}>{{ suc }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+
+            {% for suc, camaras in catalogo.items() %}
+            {% set guardado = detalles.get(suc, {}) %}
+            <div id="sucursal-{{ loop.index0 }}" class="lista-sucursal" style="display:none; margin-top: 15px;">
+                <h4 style="color: #1F497D; margin-bottom: 5px;">Cámaras de {{ suc }}</h4>
+                <div class="tabla-scroll">
+                <table>
+                    <tr>
+                        <th>#</th>
+                        <th>Nombre de la Cámara (EZStation)</th>
+                        <th>Estado</th>
+                        <th>Observación</th>
+                        <th></th>
+                    </tr>
+                    {% for cam in camaras %}
+                    {% set info = guardado.get(cam, {}) %}
+                    {% set est = info.get('estado') or 'Por verificar' %}
+                    <tr class="camera-row {{ clases[est] }}" data-suc="{{ suc }}" data-idx="{{ loop.index0 }}">
+                        <td>{{ loop.index }}</td>
+                        <td style="text-align: left; font-weight: bold;">{{ cam }}</td>
+                        <td class="celda-estado">
+                            <select style
