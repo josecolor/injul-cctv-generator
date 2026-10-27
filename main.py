@@ -1231,12 +1231,12 @@ def descargar_excel():
 
 
 # --- Módulo independiente: Plan de Monitoreo Cíclico y Novedades (/ciclico) ---
-# Tiene sus propias tablas (ciclico_*) y rutas; sólo lee CATALOGO_CAMARAS.
+# Tiene sus propias tablas (ciclico_*), rutas y bloques oficiales (ciclico.BLOQUES):
+# la cuota cíclica de 5-10 cámaras por sede NO sale de CATALOGO_CAMARAS.
 import ciclico  # noqa: E402
 
 ciclico.registrar(
     app,
-    catalogo=CATALOGO_CAMARAS,
     db_cursor=db_cursor,
     ahora=ahora,
     local_txt=local_txt,
