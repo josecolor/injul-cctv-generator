@@ -8,13 +8,18 @@ oficial de cámaras (``CATALOGO_CAMARAS``) que le entrega ``main.py``.
 El catálogo que recibe es el CATÁLOGO CÍCLICO OFICIAL (la cuota de 5 a 10 cámaras
 clave por sede que un operador audita por turno), no el inventario completo.
 
+ROTACIÓN DIARIA: las cámaras del bloque NO son fijas. Cada fecha tiene su propio plan:
+el bloque avanza por el "pool" de la sede a partir del día ancla (el del PDF oficial) y
+el operador puede cambiar cualquier cuadro (buscando en el pool). El plan de una fecha
+se congela en ``ciclico_camaras`` al primer registro, así los días pasados no cambian.
+
 Todo se guarda en PostgreSQL al instante, vinculado por fecha, y cada cambio queda
 en ``ciclico_auditoria`` para no perder el rastro de nada.
 """
 
 import logging
 import re
-from datetime import datetime
+from datetime import date, datetime
 from io import BytesIO
 from xml.sax.saxutils import escape
 
@@ -232,7 +237,9 @@ def _leer_estado(cur, fecha):
     camaras_db = {(r[0], r[1]): r[2:] for r in cur.fetchall()}
 
     sitios = []
-    for suc, nombres in catalogo.items():
+    for suc in catalogo:
+        nombres = _plan_del_dia(fecha, suc)
+        pool_total = len(_cfg["pool"].get(suc) or catalogo[suc])
         ini, fin, nov = sitios_db.get(suc, ("", "", ""))
         camaras = []
         for i, nombre in enumerate(nombres):
@@ -251,6 +258,9 @@ def _leer_estado(cur, fecha):
             "sucursal": suc,
             "total": len(nombres),                 # cuadros del bloque oficial
             "total_sede": TOTAL_SEDE.get(suc, ""),  # total de cámaras de la sede (resumen)
+            "pool_total": pool_total,
+            "pool_desde": _offset_rotacion(fecha, suc) + 1,
+            "rota": pool_total > len(nombres),
             "cuota": cuota,
             "cuota_cumplida": cuota > 0 and revisadas >= cuota,
             "revisadas": revisadas,
@@ -264,6 +274,50 @@ def _leer_estado(cur, fecha):
 
 def _estado_sitio(cur, fecha, sucursal):
     return next(s for s in _leer_estado(cur, fecha)["sitios"] if s["sucursal"] == sucursal)
+
+
+# ----------------------------------------------------------------------------
+# Rotación diaria: plan de cámaras de cada fecha
+# ----------------------------------------------------------------------------
+def _offset_rotacion(fecha, suc):
+    """Posición del pool donde empieza el bloque de esa fecha (0 en el día ancla)."""
+    n = len(_cfg["catalogo"][suc])
+    pool = _cfg["pool"].get(suc) or _cfg["catalogo"][suc]
+    if len(pool) <= n:
+        return 0
+    return ((fecha - _cfg["ancla"]).days * n) % len(pool)
+
+
+def _plan_del_dia(fecha, suc):
+    """Cámaras que tocan ese día: n cuadros consecutivos del pool, avanzando cada día."""
+    base = _cfg["catalogo"][suc]
+    n = len(base)
+    pool = _cfg["pool"].get(suc) or base
+    if len(pool) <= n:
+        return list(base)
+    off = _offset_rotacion(fecha, suc)
+    return [pool[(off + i) % len(pool)] for i in range(n)]
+
+
+def _congelar_plan(cur, fecha, suc):
+    """Guarda el plan del día para que no cambie aunque el pool o la fecha ancla cambien."""
+    _upsert(cur, "ciclico_sitios", {"fecha": fecha, "sucursal": suc}, {}, {})
+    for i, nombre in enumerate(_plan_del_dia(fecha, suc)):
+        cur.execute(
+            "INSERT INTO ciclico_camaras (fecha, sucursal, orden, camara) VALUES (%s,%s,%s,%s) "
+            "ON CONFLICT DO NOTHING",
+            (fecha, suc, i, nombre),
+        )
+
+
+def _nombres_vigentes(cur, fecha, suc):
+    """Nombres del plan del día (lo guardado manda sobre el cálculo)."""
+    nombres = _plan_del_dia(fecha, suc)
+    cur.execute("SELECT orden, camara FROM ciclico_camaras WHERE fecha=%s AND sucursal=%s", (fecha, suc))
+    for orden, camara in cur.fetchall():
+        if 0 <= orden < len(nombres):
+            nombres[orden] = camara
+    return nombres
 
 
 # ----------------------------------------------------------------------------
@@ -388,7 +442,7 @@ def api_camara():
         return jsonify(ok=False, error="Fecha no válida"), 400
     if sucursal not in _cfg["catalogo"]:
         return jsonify(ok=False, error="Sucursal no válida"), 400
-    nombres = _cfg["catalogo"][sucursal]
+    nombres = _plan_del_dia(fecha, sucursal)
     if not isinstance(idx, int) or isinstance(idx, bool) or not 0 <= idx < len(nombres):
         return jsonify(ok=False, error="Cámara no válida"), 400
     camara = nombres[idx]
@@ -398,7 +452,7 @@ def api_camara():
         with _cfg["db_cursor"]() as cur:
             _asegurar_turno(cur, fecha)
             pk_sitio = {"fecha": fecha, "sucursal": sucursal}
-            _upsert(cur, "ciclico_sitios", pk_sitio, {}, {})
+            _congelar_plan(cur, fecha, sucursal)
             pk = {"fecha": fecha, "sucursal": sucursal, "orden": idx}
             _upsert(cur, "ciclico_camaras", pk, {"camara": camara}, {})
             cur.execute(
@@ -478,6 +532,106 @@ def api_camara():
         return jsonify(ok=False, error=str(exc)), 400
     except Exception:  # noqa: BLE001
         logger.exception("Error guardando cámara cíclica")
+        return jsonify(ok=False, error="No se pudo guardar"), 500
+    return jsonify(ok=True, sitio=sitio)
+
+
+@bp.route("/api/pool")
+def api_pool():
+    """Busca en el pool de la sede (para cambiar una cámara del bloque del día)."""
+    err = _sin_db()
+    if err:
+        return err
+    fecha = _fecha_de(request.args.get("fecha")) or _cfg["ahora"]().date()
+    sucursal = request.args.get("sucursal")
+    if sucursal not in _cfg["catalogo"]:
+        return jsonify(ok=False, error="Sucursal no válida"), 400
+    palabras = request.args.get("q", "").lower().split()
+    try:
+        with _cfg["db_cursor"]() as cur:
+            en_plan = {n.lower() for n in _nombres_vigentes(cur, fecha, sucursal)}
+    except Exception:  # noqa: BLE001
+        logger.exception("Error leyendo pool cíclico")
+        return jsonify(ok=False, error="No se pudo leer"), 500
+    pool = _cfg["pool"].get(sucursal) or _cfg["catalogo"][sucursal]
+    items = [{"nombre": n, "en_plan": n.lower() in en_plan}
+             for n in pool if all(p in n.lower() for p in palabras)]
+    return jsonify(ok=True, total=len(items), items=items[:80])
+
+
+@bp.route("/api/plan", methods=["POST"])
+def api_plan():
+    """Cambia la cámara de un cuadro del bloque de esa fecha (sólo si aún no se revisó)."""
+    err = _sin_db()
+    if err:
+        return err
+    datos = request.get_json(silent=True) or {}
+    fecha = _fecha_de(datos.get("fecha"))
+    sucursal = datos.get("sucursal")
+    idx = datos.get("idx")
+    nuevo = " ".join(str(datos.get("camara") or "").split())[:150]
+    if not fecha:
+        return jsonify(ok=False, error="Fecha no válida"), 400
+    if sucursal not in _cfg["catalogo"]:
+        return jsonify(ok=False, error="Sucursal no válida"), 400
+    n = len(_cfg["catalogo"][sucursal])
+    if not isinstance(idx, int) or isinstance(idx, bool) or not 0 <= idx < n:
+        return jsonify(ok=False, error="Cuadro no válido"), 400
+    if not nuevo:
+        return jsonify(ok=False, error="Indica el nombre de la cámara"), 400
+    try:
+        with _cfg["db_cursor"]() as cur:
+            _asegurar_turno(cur, fecha)
+            _congelar_plan(cur, fecha, sucursal)
+            actuales = _nombres_vigentes(cur, fecha, sucursal)
+            cur.execute(
+                "SELECT revisada FROM ciclico_camaras WHERE fecha=%s AND sucursal=%s AND orden=%s FOR UPDATE",
+                (fecha, sucursal, idx),
+            )
+            if cur.fetchone()[0]:
+                return jsonify(ok=False, error="Esa cámara ya está revisada: desmárcala antes de cambiarla"), 409
+            if any(i != idx and a.lower() == nuevo.lower() for i, a in enumerate(actuales)):
+                return jsonify(ok=False, error="Esa cámara ya está en el bloque del día"), 409
+            _upsert(cur, "ciclico_camaras", {"fecha": fecha, "sucursal": sucursal, "orden": idx},
+                    {"camara": nuevo}, {"camara": nuevo}, camara_log=actuales[idx])
+            sitio = _estado_sitio(cur, fecha, sucursal)
+    except Exception:  # noqa: BLE001
+        logger.exception("Error cambiando cámara del plan cíclico")
+        return jsonify(ok=False, error="No se pudo guardar"), 500
+    return jsonify(ok=True, sitio=sitio)
+
+
+@bp.route("/api/plan/restablecer", methods=["POST"])
+def api_plan_restablecer():
+    """Devuelve los cuadros aún no revisados a la rotación automática de esa fecha."""
+    err = _sin_db()
+    if err:
+        return err
+    datos = request.get_json(silent=True) or {}
+    fecha = _fecha_de(datos.get("fecha"))
+    sucursal = datos.get("sucursal")
+    if not fecha:
+        return jsonify(ok=False, error="Fecha no válida"), 400
+    if sucursal not in _cfg["catalogo"]:
+        return jsonify(ok=False, error="Sucursal no válida"), 400
+    try:
+        with _cfg["db_cursor"]() as cur:
+            _asegurar_turno(cur, fecha)
+            _congelar_plan(cur, fecha, sucursal)
+            actuales = _nombres_vigentes(cur, fecha, sucursal)
+            cur.execute("SELECT orden FROM ciclico_camaras WHERE fecha=%s AND sucursal=%s AND revisada",
+                        (fecha, sucursal))
+            bloqueados = {r[0] for r in cur.fetchall()}
+            usados = {actuales[i].lower() for i in bloqueados}
+            for i, auto in enumerate(_plan_del_dia(fecha, sucursal)):
+                if i in bloqueados or actuales[i] == auto or auto.lower() in usados:
+                    continue
+                _upsert(cur, "ciclico_camaras", {"fecha": fecha, "sucursal": sucursal, "orden": i},
+                        {"camara": auto}, {"camara": auto}, camara_log=actuales[i])
+                usados.add(auto.lower())
+            sitio = _estado_sitio(cur, fecha, sucursal)
+    except Exception:  # noqa: BLE001
+        logger.exception("Error restableciendo plan cíclico")
         return jsonify(ok=False, error="No se pudo guardar"), 500
     return jsonify(ok=True, sitio=sitio)
 
@@ -1081,10 +1235,12 @@ def descargar_excel():
 # ----------------------------------------------------------------------------
 # Registro en la app principal
 # ----------------------------------------------------------------------------
-def registrar(app, catalogo, db_cursor, ahora, local_txt, ip_cliente, database_url):
+def registrar(app, catalogo, db_cursor, ahora, local_txt, ip_cliente, database_url,
+              pool=None, ancla=None):
     _cfg.update(
         catalogo=catalogo, db_cursor=db_cursor, ahora=ahora, local_txt=local_txt,
         ip_cliente=ip_cliente, database_url=database_url,
+        pool=pool or catalogo, ancla=ancla or date(2026, 10, 24),
     )
     app.register_blueprint(bp)
     if database_url:
@@ -1138,7 +1294,7 @@ PAGINA = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>INJUL - Monitoreo Cíclico</title>%%ESTILO%%
 <style>
-  .cam { display: grid; grid-template-columns: 34px 1fr 96px 96px; gap: 6px; align-items: center;
+  .cam { display: grid; grid-template-columns: 34px 1fr 96px 96px 34px; gap: 6px; align-items: center;
          padding: 6px 4px; border-bottom: 1px solid #e3e3e3; }
   .cam.hecho { background: #eef7ee; }
   .cam input[type=checkbox] { width: 24px; height: 24px; cursor: pointer; }
@@ -1149,7 +1305,15 @@ PAGINA = """<!DOCTYPE html>
   .barra > div { background: #2e7d32; height: 100%; width: 0; transition: width .2s; }
   .tiempos { display: flex; gap: 8px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 8px; }
   .tiempos > div { width: 130px; }
-  @media (max-width: 520px) { .cam { grid-template-columns: 34px 1fr 82px 82px; } }
+  .cam .cmb { padding: 4px 0; font-size: 14px; }
+  .cambio { background: #f1f5fa; border: 1px solid #cfd9e6; border-radius: 6px; padding: 8px; margin: 2px 0 6px; }
+  .cambio .res { max-height: 190px; overflow-y: auto; margin-top: 6px; }
+  .cambio .opc { padding: 7px 8px; border-bottom: 1px solid #e3e3e3; font-size: 13px; cursor: pointer; background: #fff; }
+  .cambio .opc.usada { color: #999; cursor: default; background: #f4f4f4; }
+  .rotinfo { font-size: 12px; color: #555; background: #eef2f7; border-radius: 4px; padding: 6px 8px; margin-bottom: 8px; }
+  .fechanav { display: flex; gap: 6px; }
+  .fechanav input { flex: 1; }
+  @media (max-width: 520px) { .cam { grid-template-columns: 34px 1fr 78px 78px 30px; } }
 </style></head><body><div class="wrap">
   <div class="banner">
     <h1>CENTRO DE MONITOREO GENERAL MARMOTECH</h1>
@@ -1165,7 +1329,10 @@ PAGINA = """<!DOCTYPE html>
 
   <div class="card"><h2>Datos del turno</h2>
     <div class="grid">
-      <div><label>Fecha</label><input type="date" id="f-fecha" value="{{ fecha }}"></div>
+      <div><label>Fecha (las cámaras rotan cada día)</label>
+        <div class="fechanav"><button class="btn chico gris" type="button" id="f-ant" title="Día anterior">◀</button>
+        <input type="date" id="f-fecha" value="{{ fecha }}">
+        <button class="btn chico gris" type="button" id="f-sig" title="Día siguiente">▶</button></div></div>
       <div><label>Día de rotación</label><input type="text" id="t-dia_rotacion" maxlength="40"></div>
       <div><label>Desde</label><input type="time" id="t-desde"></div>
       <div><label>Hasta</label><input type="time" id="t-hasta"></div>
@@ -1301,6 +1468,16 @@ function pintarPanel(){
   p.appendChild(el("div", {cls:"tiempos"}, [
     el("div", {}, [el("label", {text:"Hora de inicio"}), ini]), bIni,
     el("div", {}, [el("label", {text:"Hora de fin"}), fin]), bFin]));
+  var rot = el("div", {cls:"rotinfo"});
+  rot.appendChild(document.createTextNode(s.rota
+    ? "Rotación diaria: hoy tocan " + s.total + " cámaras del catálogo de la sede (desde la posición " + s.pool_desde + " de " + s.pool_total + "). Cambia cualquiera con ⇄. "
+    : "Bloque oficial de " + s.total + " cámaras (esta sede no tiene más cámaras en rotación). Puedes cambiar un cuadro con ⇄. "));
+  var bRest = el("button", {cls:"btn chico gris", type:"button", text:"↺ Restablecer rotación del día"});
+  bRest.onclick = function(){
+    post("/ciclico/api/plan/restablecer", {fecha: S.fecha, sucursal: s.sucursal}).then(function(j){ reemplazarSitio(j.sitio); }).catch(function(){});
+  };
+  rot.appendChild(bRest);
+  p.appendChild(rot);
   p.appendChild(el("div", {id:"prog-txt", style:"font-size:13px;font-weight:bold;color:#0f3a63"}));
   p.appendChild(el("div", {cls:"barra"}, [el("div", {id:"prog-bar"})]));
   var ver = el("label", {style:"text-transform:none;font-size:13px;font-weight:normal;margin-bottom:8px"});
@@ -1323,7 +1500,7 @@ function pintarChecklist(){
   $("prog-bar").style.width = (s.total ? 100 * s.revisadas / s.total : 0) + "%";
   var soloPend = $("solo-pend").checked;
   lista.innerHTML = "";
-  lista.appendChild(el("div", {cls:"cam cab"}, [el("span"), el("span", {text:"Cámara (EZStation)"}), el("span", {text:"Inicio"}), el("span", {text:"Fin"})]));
+  lista.appendChild(el("div", {cls:"cam cab"}, [el("span"), el("span", {text:"Cámara (EZStation)"}), el("span", {text:"Inicio"}), el("span", {text:"Fin"}), el("span")]));
   var nCiclos = s.total > 5 ? 2 : 1;
   s.camaras.forEach(function(c){
     if (nCiclos === 2 && (c.idx === 0 || c.idx === 5)) {
@@ -1340,8 +1517,42 @@ function pintarChecklist(){
     ci.onchange = function(){ guardarCamara(s, c, {hora_inicio: ci.value}); };
     var cf = el("input", {type:"time", value: c.hora_fin || ""});
     cf.onchange = function(){ guardarCamara(s, c, {hora_fin: cf.value}); };
-    lista.appendChild(el("div", {cls:"cam" + (c.revisada ? " hecho" : "")}, [cb, el("span", {cls:"nom", text:c.nombre}), ci, cf]));
+    var cmb = el("button", {cls:"btn chico gris cmb", type:"button", text:"⇄", title: c.revisada ? "Desmarca la cámara para cambiarla" : "Cambiar esta cámara"});
+    cmb.disabled = c.revisada;
+    var fila = el("div", {cls:"cam" + (c.revisada ? " hecho" : "")}, [cb, el("span", {cls:"nom", text:c.nombre}), ci, cf, cmb]);
+    cmb.onclick = function(){ abrirCambio(s, c, fila); };
+    lista.appendChild(fila);
   });
+}
+
+function abrirCambio(s, c, fila){
+  var sig = fila.nextSibling;
+  if (sig && sig.className === "cambio") { sig.parentNode.removeChild(sig); return; }
+  var caja = el("div", {cls:"cambio"});
+  var q = el("input", {type:"text", placeholder:"Buscar o escribir la cámara que toca en " + s.sucursal + "…"});
+  var res = el("div", {cls:"res"});
+  var libre = el("button", {cls:"btn chico", type:"button", text:"Usar el texto escrito", style:"margin-top:6px"});
+  function elegir(nombre){
+    post("/ciclico/api/plan", {fecha: S.fecha, sucursal: s.sucursal, idx: c.idx, camara: nombre})
+      .then(function(j){ reemplazarSitio(j.sitio); }).catch(function(){});
+  }
+  function buscar(){
+    fetch("/ciclico/api/pool?fecha=" + S.fecha + "&sucursal=" + encodeURIComponent(s.sucursal) + "&q=" + encodeURIComponent(q.value))
+      .then(function(r){ return r.json(); }).then(function(j){
+        res.innerHTML = "";
+        if (!j.ok || !j.items.length) { res.appendChild(el("div", {cls:"vacio", text:"Sin coincidencias"})); return; }
+        j.items.forEach(function(it){
+          var o = el("div", {cls:"opc" + (it.en_plan ? " usada" : ""), text: it.nombre + (it.en_plan ? "  (ya está en el bloque)" : "")});
+          if (!it.en_plan) o.onclick = function(){ elegir(it.nombre); };
+          res.appendChild(o);
+        });
+      });
+  }
+  q.oninput = debounce(buscar, 250);
+  libre.onclick = function(){ if (q.value.trim()) elegir(q.value.trim()); };
+  caja.appendChild(q); caja.appendChild(res); caja.appendChild(libre);
+  fila.parentNode.insertBefore(caja, fila.nextSibling);
+  buscar(); q.focus();
 }
 
 function enlazarDescargas(){
@@ -1384,6 +1595,12 @@ function enlazarTurno(){
     if (!this.value) return;
     window.location.href = "/ciclico/?fecha=" + this.value;
   };
+  function moverDia(d){
+    var p = S.fecha.split("-"), t = new Date(Date.UTC(+p[0], +p[1] - 1, +p[2] + d));
+    window.location.href = "/ciclico/?fecha=" + t.toISOString().slice(0, 10);
+  }
+  $("f-ant").onclick = function(){ moverDia(-1); };
+  $("f-sig").onclick = function(){ moverDia(1); };
   $("sel-suc").onchange = function(){ S.sel = parseInt(this.value, 10); pintarPanel(); };
   window.addEventListener("beforeunload", function(e){ if (S.pend > 0) { e.preventDefault(); e.returnValue = ""; } });
 }
