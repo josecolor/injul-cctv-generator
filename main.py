@@ -244,6 +244,16 @@ def _construir_pool(clave):
 
 POOL_CICLICO = {clave: _construir_pool(clave) for clave in CATALOGO_CICLICO}
 
+
+def camaras_no_visibles(cur, sucursal):
+    """Cámaras de una sede del inventario con estado actual 'No visible' (el módulo cíclico
+    las omite del plan; al volver a 'Operativa' se reincorporan solas)."""
+    cur.execute(
+        "SELECT camara FROM estado_camaras_actual WHERE sucursal = %s AND estado = 'No visible'",
+        (sucursal,),
+    )
+    return {fila[0] for fila in cur.fetchall()}
+
 ESTADOS = [
     ("Operativa", "Operativa (Sí)"),
     ("No visible", "No visible (Rojo)"),
@@ -1332,6 +1342,8 @@ ciclico.registrar(
     catalogo=CATALOGO_CICLICO,
     pool=POOL_CICLICO,
     ancla=ANCLA_ROTACION,
+    no_visibles=camaras_no_visibles,
+    inventario_de=INVENTARIO_DE,
     db_cursor=db_cursor,
     ahora=ahora,
     local_txt=local_txt,
