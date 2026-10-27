@@ -1,4 +1,4 @@
-"""INJUL - Consolidado Maestro de CCTV.
+"""INJUL - Consolidado Maestro de CCTV (Versión Completa y Definitiva).
 Flask + PostgreSQL + Redis (opcional).
 """
 
