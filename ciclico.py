@@ -19,7 +19,7 @@ en ``ciclico_auditoria`` para no perder el rastro de nada.
 
 import logging
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from io import BytesIO
 from xml.sax.saxutils import escape
 
@@ -238,8 +238,9 @@ def _leer_estado(cur, fecha):
 
     sitios = []
     for suc in catalogo:
-        nombres = _plan_del_dia(fecha, suc)
-        pool_total = len(_cfg["pool"].get(suc) or catalogo[suc])
+        nombres = _plan_del_dia(fecha, suc, cur)
+        pool = _pool_de(suc)
+        pool_total = len(pool)
         ini, fin, nov = sitios_db.get(suc, ("", "", ""))
         camaras = []
         for i, nombre in enumerate(nombres):
@@ -259,7 +260,7 @@ def _leer_estado(cur, fecha):
             "total": len(nombres),                 # cuadros del bloque oficial
             "total_sede": TOTAL_SEDE.get(suc, ""),  # total de cámaras de la sede (resumen)
             "pool_total": pool_total,
-            "pool_desde": _offset_rotacion(fecha, suc) + 1,
+            "pool_desde": (pool.index(nombres[0]) + 1) if nombres and nombres[0] in pool else 1,
             "rota": pool_total > len(nombres),
             "cuota": cuota,
             "cuota_cumplida": cuota > 0 and revisadas >= cuota,
@@ -279,30 +280,166 @@ def _estado_sitio(cur, fecha, sucursal):
 # ----------------------------------------------------------------------------
 # Rotación diaria: plan de cámaras de cada fecha
 # ----------------------------------------------------------------------------
-def _offset_rotacion(fecha, suc):
-    """Posición del pool donde empieza el bloque de esa fecha (0 en el día ancla)."""
-    n = len(_cfg["catalogo"][suc])
-    pool = _cfg["pool"].get(suc) or _cfg["catalogo"][suc]
-    if len(pool) <= n:
-        return 0
-    return ((fecha - _cfg["ancla"]).days * n) % len(pool)
+VENTANA_DIAS = 6  # una cámara usada no se reasigna en los 6 días siguientes (misma sede)
 
 
-def _plan_del_dia(fecha, suc):
-    """Cámaras que tocan ese día: n cuadros consecutivos del pool, avanzando cada día."""
+def _claves(nombre):
+    """Claves de comparación de una cámara: su nombre y, si lo trae, su 'IP Camera NN'.
+
+    Los nombres oficiales del bloque ("Parqueo de motores - IP Camera 34") se cruzan con
+    el inventario del consolidado ("IP Camera 34") por ese número.
+    """
+    n = " ".join(str(nombre).lower().split())
+    claves = {n}
+    claves.update("ip:" + m for m in re.findall(r"ip camera\s*0*(\d+)", n))
+    return claves
+
+
+def _segura(cur, fn):
+    """Ejecuta consultas de apoyo dentro de un SAVEPOINT: si fallan no abortan la transacción."""
+    try:
+        cur.execute("SAVEPOINT sp_ciclico_plan")
+        resultado = fn()
+        cur.execute("RELEASE SAVEPOINT sp_ciclico_plan")
+        return resultado
+    except Exception:  # noqa: BLE001
+        logger.exception("Consulta de apoyo del plan cíclico falló; se usa el plan sin ese dato")
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT sp_ciclico_plan")
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+
+def _pool_de(suc):
+    return _cfg["pool"].get(suc) or _cfg["catalogo"][suc]
+
+
+def _no_visibles_de_pool(cur, suc):
+    """Cámaras del pool de la sede marcadas 'No visible' en el consolidado (estado actual).
+
+    Se lee en vivo en cada cálculo: al repararse y pasar a 'Operativa' vuelven solas.
+    """
+    leer = _cfg.get("no_visibles")
+    inventario = (_cfg.get("inventario_de") or {}).get(suc)
+    if not leer or not inventario:
+        return set()
+    malas = _segura(cur, lambda: leer(cur, inventario)) or set()
+    claves = set()
+    for nombre in malas:
+        claves |= _claves(nombre)
+    return {c for c in _pool_de(suc) if _claves(c) & claves}
+
+
+def _plan_basico(fecha, suc):
+    """Rotación pura por fecha (sin base de datos): n cuadros consecutivos del pool."""
     base = _cfg["catalogo"][suc]
     n = len(base)
-    pool = _cfg["pool"].get(suc) or base
+    pool = _pool_de(suc)
     if len(pool) <= n:
         return list(base)
-    off = _offset_rotacion(fecha, suc)
+    off = ((fecha - _cfg["ancla"]).days * n) % len(pool)
     return [pool[(off + i) % len(pool)] for i in range(n)]
 
 
+def _elegir_bloque(pool, n, usadas, malas, previo):
+    """Elige exactamente n cámaras del pool.
+
+    1) Sólo cámaras NO usadas en la ventana y NO dañadas, continuando donde terminó el
+       bloque anterior (se recorre el pool por bloques sin repetir).
+    2) Si no alcanzan (pool agotado) se inicia un nuevo ciclo: se completa con las usadas
+       hace más tiempo.
+    3) Último recurso, con demasiadas cámaras dañadas: se completa con dañadas.
+    """
+    inicio = 0
+    if previo and previo[-1] in pool:
+        inicio = (pool.index(previo[-1]) + 1) % len(pool)
+    orden = pool[inicio:] + pool[:inicio]
+    libres = [c for c in orden if c.lower() not in usadas and c not in malas]
+    if len(libres) >= n:
+        return libres[:n]
+    elegidas = list(libres)
+    reutilizables = sorted(
+        (c for c in orden if c.lower() in usadas and c not in malas),
+        key=lambda c: usadas[c.lower()],  # las usadas hace más tiempo primero (orden estable)
+    )
+    elegidas += reutilizables[: n - len(elegidas)]
+    if len(elegidas) < n:
+        logger.warning("Sede %s: pocas cámaras operativas para completar el bloque", pool[:1])
+        elegidas += [c for c in orden if c in malas][: n - len(elegidas)]
+    return elegidas
+
+
+def _plan_del_dia(fecha, suc, cur=None):
+    """Cámaras que tocan en ``fecha`` para la sede ``suc`` (siempre la cuota exacta: 5 ó 10).
+
+    * No repite cámaras usadas en los 6 días previos (lee ``ciclico_camaras``).
+    * Omite las 'No visible' del consolidado (``estado_camaras_actual``) y reincorpora
+      las que vuelven a 'Operativa'.
+    * Los días previos aún sin guardar se simulan con la misma regla, así la rotación es
+      continua aunque el operador no haya abierto esos días. El día ancla es el bloque oficial.
+    Con ``cur=None`` abre su propia conexión; si no hay base de datos usa la rotación pura.
+    """
+    n = len(_cfg["catalogo"][suc])
+    try:
+        if not _cfg["database_url"]:
+            return _plan_basico(fecha, suc)
+        if cur is None:
+            with _cfg["db_cursor"]() as propio:
+                plan = _plan_rotado(propio, fecha, suc)
+        else:
+            plan = _plan_rotado(cur, fecha, suc)
+        if len(plan) == n:
+            return plan
+        logger.error("Plan cíclico con %s cuadros (se esperaban %s); se usa rotación pura", len(plan), n)
+    except Exception:  # noqa: BLE001
+        logger.exception("No se pudo calcular el plan cíclico desde la base de datos")
+    return _plan_basico(fecha, suc)
+
+
+def _plan_rotado(cur, fecha, suc):
+    n = len(_cfg["catalogo"][suc])
+    pool = _pool_de(suc)
+    if len(pool) < n:
+        return list(_cfg["catalogo"][suc])
+    desde = fecha - timedelta(days=2 * VENTANA_DIAS)
+    filas = _segura(cur, lambda: (
+        cur.execute(
+            "SELECT fecha, orden, camara FROM ciclico_camaras "
+            "WHERE sucursal=%s AND fecha >= %s AND fecha < %s ORDER BY fecha, orden",
+            (suc, desde, fecha),
+        ) or cur.fetchall()
+    ))
+    historial = {}  # fecha -> [cámaras del bloque] de los días ya guardados
+    for f, _orden, camara in filas or []:
+        historial.setdefault(f, []).append(camara)
+    malas = _no_visibles_de_pool(cur, suc)
+    ancla = _cfg["ancla"]
+
+    def bloque(dia):
+        if dia in historial:
+            return historial[dia]
+        previo = historial.get(dia - timedelta(days=1))
+        usadas = {}
+        for k in range(VENTANA_DIAS, 0, -1):  # del más antiguo al más reciente
+            for c in historial.get(dia - timedelta(days=k), []):
+                usadas[c.lower()] = dia - timedelta(days=k)
+        if dia == ancla:
+            usadas, previo = {}, None  # el día ancla arranca el pool: bloque oficial
+        return _elegir_bloque(pool, n, usadas, malas, previo)
+
+    # Días previos de la ventana que aún no se guardaron: se simulan en orden.
+    for k in range(VENTANA_DIAS, 0, -1):
+        dia = fecha - timedelta(days=k)
+        if dia not in historial and dia >= ancla:
+            historial[dia] = bloque(dia)
+    return bloque(fecha)
+
+
 def _congelar_plan(cur, fecha, suc):
-    """Guarda el plan del día para que no cambie aunque el pool o la fecha ancla cambien."""
+    """Guarda el plan del día para que no cambie aunque el pool o la rotación cambien."""
     _upsert(cur, "ciclico_sitios", {"fecha": fecha, "sucursal": suc}, {}, {})
-    for i, nombre in enumerate(_plan_del_dia(fecha, suc)):
+    for i, nombre in enumerate(_plan_del_dia(fecha, suc, cur)):
         cur.execute(
             "INSERT INTO ciclico_camaras (fecha, sucursal, orden, camara) VALUES (%s,%s,%s,%s) "
             "ON CONFLICT DO NOTHING",
@@ -312,7 +449,7 @@ def _congelar_plan(cur, fecha, suc):
 
 def _nombres_vigentes(cur, fecha, suc):
     """Nombres del plan del día (lo guardado manda sobre el cálculo)."""
-    nombres = _plan_del_dia(fecha, suc)
+    nombres = _plan_del_dia(fecha, suc, cur)
     cur.execute("SELECT orden, camara FROM ciclico_camaras WHERE fecha=%s AND sucursal=%s", (fecha, suc))
     for orden, camara in cur.fetchall():
         if 0 <= orden < len(nombres):
@@ -442,10 +579,9 @@ def api_camara():
         return jsonify(ok=False, error="Fecha no válida"), 400
     if sucursal not in _cfg["catalogo"]:
         return jsonify(ok=False, error="Sucursal no válida"), 400
-    nombres = _plan_del_dia(fecha, sucursal)
+    nombres = _cfg["catalogo"][sucursal]  # sólo para validar el cuadro (la cuota no cambia)
     if not isinstance(idx, int) or isinstance(idx, bool) or not 0 <= idx < len(nombres):
         return jsonify(ok=False, error="Cámara no válida"), 400
-    camara = nombres[idx]
     ahora_hhmm = _cfg["ahora"]().strftime("%H:%M")
 
     try:
@@ -453,6 +589,7 @@ def api_camara():
             _asegurar_turno(cur, fecha)
             pk_sitio = {"fecha": fecha, "sucursal": sucursal}
             _congelar_plan(cur, fecha, sucursal)
+            camara = _nombres_vigentes(cur, fecha, sucursal)[idx]
             pk = {"fecha": fecha, "sucursal": sucursal, "orden": idx}
             _upsert(cur, "ciclico_camaras", pk, {"camara": camara}, {})
             cur.execute(
@@ -550,11 +687,12 @@ def api_pool():
     try:
         with _cfg["db_cursor"]() as cur:
             en_plan = {n.lower() for n in _nombres_vigentes(cur, fecha, sucursal)}
+            malas = _no_visibles_de_pool(cur, sucursal)
     except Exception:  # noqa: BLE001
         logger.exception("Error leyendo pool cíclico")
         return jsonify(ok=False, error="No se pudo leer"), 500
     pool = _cfg["pool"].get(sucursal) or _cfg["catalogo"][sucursal]
-    items = [{"nombre": n, "en_plan": n.lower() in en_plan}
+    items = [{"nombre": n, "en_plan": n.lower() in en_plan, "no_visible": n in malas}
              for n in pool if all(p in n.lower() for p in palabras)]
     return jsonify(ok=True, total=len(items), items=items[:80])
 
@@ -623,7 +761,7 @@ def api_plan_restablecer():
                         (fecha, sucursal))
             bloqueados = {r[0] for r in cur.fetchall()}
             usados = {actuales[i].lower() for i in bloqueados}
-            for i, auto in enumerate(_plan_del_dia(fecha, sucursal)):
+            for i, auto in enumerate(_plan_del_dia(fecha, sucursal, cur)):
                 if i in bloqueados or actuales[i] == auto or auto.lower() in usados:
                     continue
                 _upsert(cur, "ciclico_camaras", {"fecha": fecha, "sucursal": sucursal, "orden": i},
@@ -1236,11 +1374,12 @@ def descargar_excel():
 # Registro en la app principal
 # ----------------------------------------------------------------------------
 def registrar(app, catalogo, db_cursor, ahora, local_txt, ip_cliente, database_url,
-              pool=None, ancla=None):
+              pool=None, ancla=None, no_visibles=None, inventario_de=None):
     _cfg.update(
         catalogo=catalogo, db_cursor=db_cursor, ahora=ahora, local_txt=local_txt,
         ip_cliente=ip_cliente, database_url=database_url,
         pool=pool or catalogo, ancla=ancla or date(2026, 10, 24),
+        no_visibles=no_visibles, inventario_de=inventario_de or {},
     )
     app.register_blueprint(bp)
     if database_url:
@@ -1470,7 +1609,7 @@ function pintarPanel(){
     el("div", {}, [el("label", {text:"Hora de fin"}), fin]), bFin]));
   var rot = el("div", {cls:"rotinfo"});
   rot.appendChild(document.createTextNode(s.rota
-    ? "Rotación diaria: hoy tocan " + s.total + " cámaras del catálogo de la sede (desde la posición " + s.pool_desde + " de " + s.pool_total + "). Cambia cualquiera con ⇄. "
+    ? "Rotación diaria: hoy tocan " + s.total + " cámaras (sin repetir las de los últimos 6 días y sin las marcadas «No visible»). Pool de la sede: " + s.pool_total + ". Cambia cualquiera con ⇄. "
     : "Bloque oficial de " + s.total + " cámaras (esta sede no tiene más cámaras en rotación). Puedes cambiar un cuadro con ⇄. "));
   var bRest = el("button", {cls:"btn chico gris", type:"button", text:"↺ Restablecer rotación del día"});
   bRest.onclick = function(){
@@ -1542,7 +1681,7 @@ function abrirCambio(s, c, fila){
         res.innerHTML = "";
         if (!j.ok || !j.items.length) { res.appendChild(el("div", {cls:"vacio", text:"Sin coincidencias"})); return; }
         j.items.forEach(function(it){
-          var o = el("div", {cls:"opc" + (it.en_plan ? " usada" : ""), text: it.nombre + (it.en_plan ? "  (ya está en el bloque)" : "")});
+          var o = el("div", {cls:"opc" + (it.en_plan ? " usada" : ""), text: it.nombre + (it.en_plan ? "  (ya está en el bloque)" : "") + (it.no_visible ? "  ⚠ No visible" : "")});
           if (!it.en_plan) o.onclick = function(){ elegir(it.nombre); };
           res.appendChild(o);
         });
