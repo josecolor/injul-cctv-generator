@@ -3,194 +3,165 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>INJUL - Consolidado CCTV</title>
+    <title>INJUL - Consolidado Maestro de CCTV</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
-        body { font-family: Arial, sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 15px; }
-        .container { max-width: 1050px; margin: 0 auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
-        h1 { color: #1F497D; font-size: 20px; border-bottom: 2px solid #1F497D; padding-bottom: 8px; }
-        h3 { color: #1F497D; margin-top: 5px; }
-        .card { background: #f8f9fa; padding: 15px; margin-bottom: 15px; border-radius: 6px; border-left: 4px solid #1F497D; }
-        .btn { display: inline-block; background: #1F497D; color: white; padding: 10px 15px; text-decoration: none; border-radius: 4px; font-weight: bold; margin-top: 5px; margin-right: 5px; border: none; cursor: pointer; font-size: 14px; }
-        .btn-gris { background: #6c757d; }
-        .btn-limpiar { background: #c9302c; color: white; border: none; padding: 5px 8px; border-radius: 3px; cursor: pointer; font-size: 12px; }
-        .form-group { margin-bottom: 10px; }
-        label { display: block; font-weight: bold; font-size: 13px; margin-bottom: 3px; color: #444; }
-        select, input { width: 100%; padding: 6px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
-        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
-        th, td { border: 1px solid #ddd; padding: 6px; text-align: center; font-size: 11px; }
-        th { background-color: #1F497D; color: white; }
-        .estado-op td.celda-estado { background: #dff0d8; }
-        .estado-nv td.celda-estado { background: #f2dede; }
-        .estado-pv td.celda-estado { background: #fcf8e3; }
-        .marca { font-size: 11px; color: #777; white-space: nowrap; min-width: 60px; }
-        .marca.ok { color: #2d6a2d; }
-        .marca.error { color: #a94442; font-weight: bold; }
-        .kpis { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 15px; }
-        .kpi { flex: 1; min-width: 110px; background: #f8f9fa; border-top: 3px solid #1F497D; padding: 8px; text-align: center; }
-        .kpi b { display: block; font-size: 22px; color: #1F497D; }
-        .kpi span { font-size: 11px; color: #666; }
-        .tabla-scroll { overflow-x: auto; }
-        .obs-box { display: flex; gap: 4px; align-items: center; }
+        body { background-color: #f8f9fa; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        .navbar { background-color: #1b263b; }
+        .card-resumen { border-left: 4px solid #415a77; }
+        .estado-op { background-color: #d1e7dd !important; color: #0f5132; }
+        .estado-nv { background-color: #f8d7da !important; color: #842029; }
+        .estado-pv { background-color: #fff3cd !important; color: #664d03; }
     </style>
-    <script>
-        var CLASES = {'Operativa': 'estado-op', 'No visible': 'estado-nv', 'Por verificar': 'estado-pv'};
-
-        function mostrarSucursal() {
-            var select = document.getElementById('sucursal-select');
-            var listas = document.getElementsByClassName('lista-sucursal');
-            for (var i = 0; i < listas.length; i++) {
-                listas[i].style.display = (listas[i].id === 'sucursal-' + select.selectedIndex) ? 'block' : 'none';
-            }
-        }
-
-        function actualizarResumen(r) {
-            document.getElementById('k-total').textContent = r.total;
-            document.getElementById('k-op').textContent = r.operativas;
-            document.getElementById('k-nv').textContent = r.no_visibles;
-            document.getElementById('k-pv').textContent = r.por_verificar;
-            document.getElementById('k-disp').textContent = r.disponibilidad.toFixed(1) + '%';
-        }
-
-        function guardarFila(tr) {
-            var marca = tr.querySelector('.marca');
-            var estado = tr.querySelector('.select-estado').value;
-            var en_vivo = tr.querySelector('.select-envivo').value;
-            var grabacion = tr.querySelector('.select-grab').value;
-            var obs = tr.querySelector('.input-obs').value;
-
-            marca.className = 'marca';
-            marca.textContent = 'Guardando...';
-
-            fetch('/api/camara', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    sucursal: tr.dataset.suc,
-                    idx: parseInt(tr.dataset.idx, 10),
-                    estado: estado,
-                    en_vivo: en_vivo,
-                    grabacion: grabacion,
-                    observacion: obs
-                })
-            }).then(function (resp) {
-                return resp.json().then(function (j) { return {ok: resp.ok, j: j}; });
-            }).then(function (res) {
-                if (!res.ok || !res.j.ok) { throw new Error('Error'); }
-                tr.className = 'camera-row ' + (CLASES[estado] || 'estado-pv');
-                marca.className = 'marca ok';
-                marca.textContent = res.j.cambiado ? 'Guardado ✓' : 'Sin cambios';
-                actualizarResumen(res.j.resumen);
-            }).catch(function () {
-                marca.className = 'marca error';
-                marca.textContent = 'Error';
-            });
-        }
-
-        window.onload = function () {
-            mostrarSucursal();
-            var filas = document.querySelectorAll('tr.camera-row');
-            for (var i = 0; i < filas.length; i++) {
-                (function (tr) {
-                    tr.querySelector('.select-estado').addEventListener('change', function () { guardarFila(tr); });
-                    tr.querySelector('.select-envivo').addEventListener('change', function () { guardarFila(tr); });
-                    tr.querySelector('.select-grab').addEventListener('change', function () { guardarFila(tr); });
-                    tr.querySelector('.input-obs').addEventListener('change', function () { guardarFila(tr); });
-                    
-                    // Botón basurero para limpiar la observación
-                    var btnLimpiar = tr.querySelector('.btn-limpiar');
-                    if (btnLimpiar) {
-                        btnLimpiar.addEventListener('click', function () {
-                            tr.querySelector('.input-obs').value = '';
-                            guardarFila(tr);
-                        });
-                    }
-                })(filas[i]);
-            }
-        };
-    </script>
 </head>
 <body>
-    <div class="container">
-        <h1>INJUL - Sistema de Monitoreo CCTV</h1>
 
-        <div class="kpis">
-            <div class="kpi"><b id="k-total">{{ resumen.total }}</b><span>Cámaras</span></div>
-            <div class="kpi"><b id="k-op">{{ resumen.operativas }}</b><span>Operativas</span></div>
-            <div class="kpi"><b id="k-nv">{{ resumen.no_visibles }}</b><span>No visibles</span></div>
-            <div class="kpi"><b id="k-pv">{{ resumen.por_verificar }}</b><span>Por verificar</span></div>
-            <div class="kpi"><b id="k-disp">{{ '%.1f'|format(resumen.disponibilidad) }}%</b><span>Disponibilidad</span></div>
+    <!-- Menú Superior -->
+    <nav class="navbar navbar-expand-lg navbar-dark shadow-sm">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="/"><i class="fa-solid fa-video me-2"></i>INJUL CCTV</a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav ms-auto">
+                    <li class="nav-item"><a class="nav-link active" href="/"><i class="fa-solid fa-house me-1"></i> Resumen</a></li>
+                    <li class="nav-item"><a class="nav-link" href="/ciclico"><init class="fa-solid fa-rotate me-1"></init> Monitoreo Cíclico</a></li>
+                    <li class="nav-item"><a class="nav-link" href="/historial"><i class="fa-solid fa-clock-rotate-left me-1"></i> Historial</a></li>
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Contenido Principal -->
+    <div class="container my-4">
+        
+        <!-- Tarjetas de Resumen Global -->
+        <div class="row text-center mb-4">
+            <div class="col-md-3 mb-2">
+                <div class="card shadow-sm p-3 card-resumen">
+                    <h5>Total Cámaras</h5>
+                    <h3 class="text-primary">{{ resumen.total }}</h3>
+                </div>
+            </div>
+            <div class="col-md-3 mb-2">
+                <div class="card shadow-sm p-3 card-resumen">
+                    <h5>Operativas</h5>
+                    <h3 class="text-success">{{ resumen.operativas }}</h3>
+                </div>
+            </div>
+            <div class="col-md-3 mb-2">
+                <div class="card shadow-sm p-3 card-resumen">
+                    <h5>No Visibles</h5>
+                    <h3 class="text-danger">{{ resumen.no_visibles }}</h3>
+                </div>
+            </div>
+            <div class="col-md-3 mb-2">
+                <div class="card shadow-sm p-3 card-resumen">
+                    <h5>Disponibilidad</h5>
+                    <h3 class="text-info">{{ "%.1f"|format(resumen.disponibilidad) }}%</h3>
+                </div>
+            </div>
         </div>
 
-        <div class="card">
-            <h3>Seleccionar Sucursal y Revisar Cámaras</h3>
-            <div class="form-group">
-                <label>Sucursal:</label>
-                <select id="sucursal-select" onchange="mostrarSucursal()">
+        <!-- Selector de Sucursales y Listado de Cámaras -->
+        <div class="card shadow-sm p-4">
+            <h4 class="mb-3"><i class="fa-solid fa-building-shield me-2"></i>Seleccionar Sucursal y Revisar Cámaras</h4>
+            
+            <div class="mb-3">
+                <label for="selectSucursal" class="form-label fw-bold">Sucursal:</label>
+                <select id="selectSucursal" class="form-select" onchange="cambiarSucursal(this.value)">
                     {% for suc in catalogo.keys() %}
-                    <option value="{{ suc }}" {% if loop.index0 == seleccion %}selected{% endif %}>{{ suc }}</option>
+                        <option value="{{ loop.index0 }}" {% if seleccion == loop.index0 %}selected{% endif %}>{{ suc }}</option>
                     {% endfor %}
                 </select>
             </div>
 
-            {% for suc, camaras in catalogo.items() %}
-            {% set guardado = detalles.get(suc, {}) %}
-            <div id="sucursal-{{ loop.index0 }}" class="lista-sucursal" style="display:none; margin-top: 15px;">
-                <h4 style="color: #1F497D; margin-bottom: 5px;">Cámaras de {{ suc }}</h4>
-                <div class="tabla-scroll">
-                <table>
-                    <tr>
-                        <th>#</th>
-                        <th>Cámara (EZStation)</th>
-                        <th>En vivo</th>
-                        <th>Grabación</th>
-                        <th>Estado</th>
-                        <th>Observación</th>
-                        <th></th>
-                    </tr>
-                    {% for cam in camaras %}
-                    {% set info = guardado.get(cam, {}) %}
-                    {% set est = info.get('estado') or 'Por verificar' %}
-                    {% set env = info.get('en_vivo') or '' %}
-                    {% set grb = info.get('grabacion') or 'Normal' %}
-                    <tr class="camera-row {{ clases[est] }}" data-suc="{{ suc }}" data-idx="{{ loop.index0 }}">
-                        <td>{{ loop.index }}</td>
-                        <td style="text-align: left; font-weight: bold;">{{ cam }}</td>
-                        <td>
-                            <select class="select-envivo" style="padding: 3px;">
-                                <option value="" {% if env == '' %}selected{% endif %}>— (Vacío)</option>
-                                <option value="Sí" {% if env == 'Sí' %}selected{% endif %}>Sí</option>
-                                <option value="No" {% if env == 'No' %}selected{% endif %}>No</option>
-                                <option value="Intermitente" {% if env == 'Intermitente' %}selected{% endif %}>Intermitente</option>
-                            </select>
-                        </td>
-                        <td>
-                            <select class="select-grab" style="padding: 3px;">
-                                <option value="Normal" {% if grb == 'Normal' %}selected{% endif %}>Normal</option>
-                                <option value="Por movimiento" {% if grb == 'Por movimiento' %}selected{% endif %}>Por movimiento</option>
-                                <option value="No graba" {% if grb == 'No graba' %}selected{% endif %}>No graba</option>
-                            </select>
-                        </td>
-                        <td class="celda-estado">
-                            <select class="select-estado" style="padding: 3px;">
-                                {% for valor, texto in estados %}
-                                <option value="{{ valor }}" {% if est == valor %}selected{% endif %}>{{ texto }}</option>
-                                {% endfor %}
-                            </select>
-                        </td>
-                        <td>
-                            <div class="obs-box">
-                                <input type="text" class="input-obs" value="{{ info.get('observacion', '') }}" maxlength="500" placeholder="Detalle...">
-                                <button type="button" class="btn-limpiar" title="Borrar observación">🗑️</button>
-                            </div>
-                        </td>
-                        <td class="marca"></td>
-                    </tr>
-                    {% endfor %}
+            {% set sucursal_actual = list(catalogo.keys())[seleccion] if seleccion < catalogo.keys()|list|length else catalogo.keys()|list|index(0) %}
+            
+            <h5 class="mt-4 text-secondary">Cámaras de <span class="text-dark">{{ sucursal_actual }}</span></h5>
+            
+            <div class="table-responsive">
+                <table class="table table-bordered table-striped align-middle">
+                    <thead class="table-dark">
+                        <tr>
+                            <th style="width: 5%;">#</th>
+                            <th style="width: 30%;">Cámara (EZStation)</th>
+                            <th style="width: 15%;">En vivo</th>
+                            <th style="width: 15%;">Grabación</th>
+                            <th style="width: 20%;">Estado</th>
+                            <th style="width: 15%;">Observación</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for cam in catalogo[sucursal_actual] %}
+                        {% set info = detalles.get(sucursal_actual, {}).get(cam, {}) %}
+                        {% set est = info.get('estado', 'Por verificar') %}
+                        <tr>
+                            <td>{{ loop.index }}</td>
+                            <td><strong>{{ cam }}</strong></td>
+                            <td>
+                                <input type="text" class="form-control form-control-sm" value="{{ info.get('en_vivo', '') }}" onchange="guardarCamara('{{ sucursal_actual }}', {{ loop.index0 }}, this)">
+                            </td>
+                            <td>
+                                <select class="form-select form-select-sm" onchange="guardarCamara('{{ sucursal_actual }}', {{ loop.index0 }}, this)">
+                                    <option value="Normal" {% if info.get('grabacion') == 'Normal' %}selected{% endif %}>Normal</option>
+                                    <option value="Por movimiento" {% if info.get('grabacion') == 'Por movimiento' %}selected{% endif %}>Por movimiento</option>
+                                    <option value="No graba" {% if info.get('grabacion') == 'No graba' %}selected{% endif %}>No graba</option>
+                                </select>
+                            </td>
+                            <td>
+                                <select class="form-select form-select-sm {% if est == 'Operativa' %}estado-op{% elif est == 'No visible' %}estado-nv{% else %}estado-pv{% endif %}" onchange="guardarCamara('{{ sucursal_actual }}', {{ loop.index0 }}, this)">
+                                    {% for valor, texto in estados %}
+                                    <option value="{{ valor }}" {% if est == valor %}selected{% endif %}>{{ texto }}</option>
+                                    {% endfor %}
+                                </select>
+                            </td>
+                            <td>
+                                <input type="text" class="form-control form-control-sm" value="{{ info.get('observacion', '') }}" placeholder="Detalle..." onchange="guardarCamara('{{ sucursal_actual }}', {{ loop.index0 }}, this)">
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
                 </table>
-                </div>
             </div>
-            {% endfor %}
         </div>
+
     </div>
+
+    <script>
+        function cambiarSucursal(idx) {
+            window.location.href = "/?s=" + idx;
+        }
+
+        function guardarCamara(sucursal, idx, elemento) {
+            // Lógica asíncrona para guardar cambios sin recargar toda la página
+            let fila = elemento.closest('tr');
+            let inputs = fila.querySelectorAll('input, select');
+            
+            let datos = {
+                sucursal: sucursal,
+                idx: idx,
+                en_vivo: inputs[0].value,
+                grabacion: inputs[1].value,
+                estado: inputs[2].value,
+                observacion: inputs[3].value
+            };
+
+            fetch('/api/camara', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(datos)
+            }).then(res => res.json()).then(res => {
+                if(res.ok) {
+                    // Actualiza clase visual del selector de estado
+                    let selEstado = inputs[2];
+                    selEstado.className = "form-select form-select-sm " + (selEstado.value === 'Operativa' ? 'estado-op' : (selEstado.value === 'No visible' ? 'estado-nv' : 'estado-pv'));
+                }
+            });
+        }
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 </html>
