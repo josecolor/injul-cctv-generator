@@ -20,10 +20,11 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import letter
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
-from reportlab.lib.units import inch
 from reportlab.platypus import (
+    Flowable,
     KeepTogether,
     Paragraph,
     SimpleDocTemplate,
@@ -515,11 +516,6 @@ def auditoria():
 # ----------------------------------------------------------------------------
 # Descargas: PDF y Excel del turno (sólo lectura de las tablas ciclico_*)
 # ----------------------------------------------------------------------------
-AZUL = colors.HexColor("#0F3A63")
-VERDE_CLARO = colors.HexColor("#EEF7EE")
-GRIS = colors.HexColor("#F4F4F4")
-
-
 def _txt(valor):
     """Escapa texto para Paragraph de ReportLab."""
     return escape(str(valor if valor is not None else ""))
@@ -530,137 +526,376 @@ def _fecha_larga(iso):
 
 
 def _estado_para_reporte(fecha):
+    """Lee el día completo y la hora del último cambio (para 'Hora del informe')."""
     with _cfg["db_cursor"]() as cur:
-        return _leer_estado(cur, fecha)
+        estado = _leer_estado(cur, fecha)
+        cur.execute("SELECT MAX(cambiado_en) FROM ciclico_auditoria WHERE fecha = %s", (fecha,))
+        ultimo = cur.fetchone()[0]
+    if ultimo is not None:
+        # local_txt -> "dd/mm/aaaa hh:mm:ss AM"; se toma "hh:mm AM"
+        partes = _cfg["local_txt"](ultimo).split(" ")
+        estado["hora_informe"] = f"{partes[1][:5]} {partes[2]}"
+    else:
+        estado["hora_informe"] = _cfg["ahora"]().strftime("%I:%M %p")
+    return estado
 
 
-def construir_pdf_ciclico(estado):
-    turno, sitios = estado["turno"], estado["sitios"]
+# --- Formato oficial INJUL (réplica del PDF institucional "Plan de Monitoreo
+# Tiempo Real Cíclico Diario"). No modernizar: colores, orden de secciones,
+# rótulos y estructura de bloques son normativos. ---------------------------
+NAVY = colors.HexColor("#0C3B66")
+VERDE = colors.HexColor("#2E7D32")
+ROJO = colors.HexColor("#EA4335")
+VERDE_CHECK = colors.HexColor("#08E608")
+VERDE_SN = colors.HexColor("#00C800")
+BORDE = colors.HexColor("#DADADA")
+CAJA = colors.HexColor("#F5F5F5")
+FILA_ALT = colors.HexColor("#F7F9F9")
+GRIS_ETQ = colors.HexColor("#666666")
+CUADRO_VACIO = colors.HexColor("#E0E0E0")
+
+A4_W, A4_H = A4
+MARGEN_X = 63
+ANCHO = A4_W - 2 * MARGEN_X  # ancho útil (≈ ancho del banner oficial)
+
+# Nombre con el que cada sede del catálogo aparece en el formato oficial.
+# El orden de este diccionario es el orden oficial de las sedes en el PDF.
+NOMBRES_OFICIALES = {
+    "Sucursal San Cristóbal": "SAN CRISTÓBAL",
+    "Marmotech DCM": "SANTO DOMINGO (DCM)",
+    "Marmotech Santiago 1": "SANTIAGO 1",
+    "Marmotech Santiago 2": "SANTIAGO 2",
+    "Santiago 2 - Sección Muebles": "SANTIAGO 2 - MUEBLES",
+    "Marmotech Blue Mall": "BLUE MALL",
+    "Marmotech Outlet RP": "OUTLET RP",
+    "Marmotech Punta Cana": "PUNTA CANA",
+    "Caribbean Agregados": "CARIBBEAN (AGREGADOS)",
+}
+ORDEN_OFICIAL = {k: i for i, k in enumerate(NOMBRES_OFICIALES)}
+
+
+def _nombre_oficial(sucursal):
+    return NOMBRES_OFICIALES.get(sucursal, sucursal.upper())
+
+
+def _ps(nombre, **kw):
+    base = dict(fontName="Helvetica", fontSize=8, leading=10, textColor=colors.HexColor("#222222"))
+    base.update(kw)
+    return ParagraphStyle(nombre, **base)
+
+
+E_TITULO = _ps("titulo", fontName="Helvetica-Bold", fontSize=12.5, leading=16, textColor=colors.white, alignment=TA_CENTER)
+E_SUB = _ps("sub", fontSize=8.5, leading=11, textColor=colors.white, alignment=TA_CENTER)
+E_ETQ = _ps("etq", fontName="Helvetica-Bold", fontSize=7, leading=9, textColor=GRIS_ETQ)
+E_VAL = _ps("val", fontName="Helvetica-Bold", fontSize=8.5, leading=10)
+E_BARRA = _ps("barra", fontName="Helvetica-Bold", fontSize=7.5, leading=9, textColor=colors.white)
+E_TH = _ps("th", fontName="Helvetica-Bold", fontSize=6.8, leading=8, textColor=colors.white)
+E_FILA = _ps("fila", fontSize=8, leading=10, textColor=colors.HexColor("#333333"))
+E_SITIO = _ps("sitio", fontName="Helvetica-Bold", fontSize=10, leading=12, textColor=NAVY)
+E_COL = _ps("col", fontName="Helvetica-Bold", fontSize=9, leading=11, textColor=NAVY, alignment=TA_CENTER)
+E_CAM = _ps("cam", fontSize=7, leading=8.5, textColor=NAVY)
+E_HORA = _ps("hora", fontName="Helvetica-Bold", fontSize=8, leading=9.5, alignment=TA_CENTER)
+E_NOV_ETQ = _ps("novetq", fontSize=8, leading=10)
+E_NOV = _ps("nov", fontSize=8.5, leading=11)
+E_INF_T = _ps("inft", fontName="Helvetica-Bold", fontSize=8.5, leading=11, alignment=TA_CENTER)
+E_INF = _ps("inf", fontName="Helvetica-Bold", fontSize=7, leading=9, alignment=TA_CENTER)
+E_PIE = _ps("pie", fontName="Helvetica-Oblique", fontSize=7.5, leading=9, textColor=colors.HexColor("#888888"), alignment=TA_CENTER)
+
+
+class Cuadro(Flowable):
+    """Cuadro de estado (verde = ok, rojo = novedad, gris = pendiente)."""
+
+    def __init__(self, color, lado=12):
+        super().__init__()
+        self.color, self.lado = color, lado
+
+    def wrap(self, aw, ah):
+        return self.lado, self.lado
+
+    def draw(self):
+        c = self.canv
+        c.setFillColor(self.color)
+        c.setStrokeColor(self.color)
+        c.rect(0, 0, self.lado, self.lado, stroke=0, fill=1)
+
+
+class Casilla(Flowable):
+    """Casilla de verificación; marcada = visto verde como en el formato oficial."""
+
+    def __init__(self, marcada):
+        super().__init__()
+        self.marcada = marcada
+
+    def wrap(self, aw, ah):
+        return 12, 12
+
+    def draw(self):
+        c = self.canv
+        c.setStrokeColor(colors.HexColor("#9E9E9E"))
+        c.setFillColor(colors.white)
+        c.setLineWidth(0.8)
+        c.rect(0.5, 0.5, 10, 10, stroke=1, fill=1)
+        if self.marcada:
+            _visto(c, 0, 0, 1.0, 1.8)
+
+
+def _visto(c, x, y, escala, grosor):
+    c.saveState()
+    c.setStrokeColor(VERDE_CHECK)
+    c.setLineWidth(grosor)
+    c.setLineCap(1)
+    c.setLineJoin(1)
+    p = c.beginPath()
+    p.moveTo(x + 1 * escala, y + 5 * escala)
+    p.lineTo(x + 4.5 * escala, y + 1 * escala)
+    p.lineTo(x + 12 * escala, y + 13 * escala)
+    c.drawPath(p, stroke=1, fill=0)
+    c.restoreState()
+
+
+def _icono_camara(c, x, y):
+    """Cámara de vigilancia (icono verde del resumen)."""
+    c.saveState()
+    c.translate(x, y)
+    c.setFillColor(VERDE)
+    c.setStrokeColor(VERDE)
+    c.rotate(-12)
+    c.roundRect(2, 5, 13, 7.5, 2, stroke=0, fill=1)   # cuerpo
+    c.roundRect(14, 6.5, 3.5, 4.5, 1, stroke=0, fill=1)  # lente
+    c.setFillColor(colors.white)
+    c.circle(6, 8.7, 1.5, stroke=0, fill=1)
+    c.setFillColor(VERDE)
+    c.setLineWidth(1.6)
+    c.line(5, 5, 3, 1)                                  # soporte
+    c.rect(0.5, 0, 5, 1.6, stroke=0, fill=1)
+    c.restoreState()
+
+
+class EstadoMonitoreo(Flowable):
+    """Columna 'CÁMARAS MONITOREADAS HOY' del resumen."""
+
+    def __init__(self, completo, revisadas, total, novedad):
+        super().__init__()
+        self.completo, self.revisadas, self.total, self.novedad = completo, revisadas, total, novedad
+
+    def wrap(self, aw, ah):
+        return 118, 17
+
+    def draw(self):
+        c = self.canv
+        if self.completo:
+            _icono_camara(c, 8, 2)
+            _visto(c, 36, 1, 1.0, 1.8)
+        elif self.revisadas:
+            c.setFont("Helvetica", 7.5)
+            c.setFillColor(GRIS_ETQ)
+            c.drawString(8, 5, f"{self.revisadas} / {self.total}")
+        if self.novedad:
+            c.setFillColor(ROJO)
+            c.rect(62, 3, 11, 11, stroke=0, fill=1)
+            c.setFont("Helvetica", 6.8)
+            c.drawString(77, 6, "novedad")
+
+
+def _hora12(hhmm):
+    if not hhmm:
+        return "—"
+    hh, mm = hhmm.split(":")
+    n = int(hh)
+    return f"{n % 12 or 12:02d}:{mm}{'AM' if n < 12 else 'PM'}"
+
+
+def _turno_nombre(desde):
+    if not desde:
+        return ""
+    h = int(desde.split(":")[0])
+    return " – TURNO DE LA MAÑANA" if h < 12 else (" – TURNO DE LA TARDE" if h < 18 else " – TURNO DE LA NOCHE")
+
+
+def _caja_redonda(contenido, ancho, alto=None, relleno=None, borde=BORDE, pad_izq=10):
+    t = Table([[contenido]], colWidths=[ancho], rowHeights=[alto] if alto else None)
+    estilo = [
+        ("BOX", (0, 0), (-1, -1), 0.8, borde), ("ROUNDEDCORNERS", [3, 3, 3, 3]),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("LEFTPADDING", (0, 0), (-1, -1), pad_izq),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8), ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]
+    if relleno is not None:
+        estilo.append(("BACKGROUND", (0, 0), (-1, -1), relleno))
+    t.setStyle(TableStyle(estilo))
+    return t
+
+
+def _campo(etiqueta, valor, ancho):
+    t = Table(
+        [[Paragraph(etiqueta, E_ETQ)], [_caja_redonda(Paragraph(_txt(valor) or "&nbsp;", E_VAL), ancho, 21)]],
+        colWidths=[ancho],
+    )
+    t.setStyle(TableStyle([
+        ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 1), ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+    ]))
+    return t
+
+
+def _bloque_sitio(s, solo_revisadas):
+    """Bloque de una sede: nombre + INICIO/FIN, checklist con horas y novedades."""
+    novedad = bool(s["novedades"])
+    completo = s["revisadas"] == s["total"]
+    verde_ini = bool(s["hora_inicio"]) or s["revisadas"] > 0
+    verde_fin = bool(s["hora_fin"]) or completo
+    c_ini = ROJO if novedad else (VERDE if verde_ini else CUADRO_VACIO)
+    c_fin = ROJO if novedad else (VERDE if verde_fin else CUADRO_VACIO)
+
+    w0, w1 = 24, 205
+    w23 = (ANCHO - w0 - w1) / 2
+    nombre = Table([[Paragraph(_txt(_nombre_oficial(s["sucursal"])), E_SITIO), Cuadro(c_ini)]],
+                   colWidths=[w1 - 40, 18])
+    nombre.setStyle(TableStyle([
+        ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    fin_cab = Table([[Paragraph("FIN", E_COL), Cuadro(c_fin)]], colWidths=[w23 - 30, 22])
+    fin_cab.setStyle(TableStyle([
+        ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+    ]))
+
+    filas = [[nombre, "", Paragraph("INICIO", E_COL), fin_cab]]
+    camaras = [c for c in s["camaras"] if c["revisada"]] if solo_revisadas else s["camaras"]
+    if camaras:
+        for c in camaras:
+            filas.append([Casilla(c["revisada"]), Paragraph(_txt(c["nombre"]), E_CAM),
+                          Paragraph(_txt(c["hora_inicio"]), E_HORA), Paragraph(_txt(c["hora_fin"]), E_HORA)])
+    else:
+        filas.append(["", Paragraph("<i>(sin cámaras revisadas)</i>", E_CAM), "", ""])
+    n = len(filas) - 1  # última fila de cámaras
+
+    filas.append([Paragraph("Novedades y acciones tomadas.", E_NOV_ETQ), "", "", ""])
+    if novedad:
+        cuerpo = "no:&nbsp;&nbsp;" + _txt(s["novedades"]).replace("\n", "<br/>")
+    else:
+        cuerpo = 'no:&nbsp;&nbsp;<font name="Helvetica-Bold" color="#00C800">s/n</font>'
+    caja = _caja_redonda(Paragraph(cuerpo, E_NOV), ANCHO - 26, 30 if not novedad else None, CAJA, colors.HexColor("#E3E3E3"), 12)
+    filas.append([caja, "", "", ""])
+
+    t = Table(filas, colWidths=[w0, w1, w23, w23], repeatRows=1)
+    t.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.8, BORDE), ("ROUNDEDCORNERS", [4, 4, 4, 4]),
+        ("LINEBEFORE", (0, 0), (0, -1), 4, NAVY),
+        ("SPAN", (0, 0), (1, 0)), ("LINEBELOW", (0, 0), (-1, 0), 0.6, BORDE),
+        ("LINEBEFORE", (2, 1), (2, n), 3, colors.black), ("LINEBEFORE", (3, 1), (3, n), 3, colors.black),
+        ("SPAN", (0, n + 1), (-1, n + 1)), ("SPAN", (0, n + 2), (-1, n + 2)),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("ALIGN", (2, 0), (3, -1), "CENTER"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4), ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 2.2), ("BOTTOMPADDING", (0, 0), (-1, -1), 2.2),
+        ("LEFTPADDING", (0, 0), (0, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, 0), 6), ("BOTTOMPADDING", (0, 0), (-1, 0), 4),
+        ("TOPPADDING", (0, n + 1), (-1, n + 1), 5), ("BOTTOMPADDING", (0, n + 2), (-1, n + 2), 8),
+        ("LEFTPADDING", (0, n + 2), (-1, n + 2), 14), ("RIGHTPADDING", (0, n + 2), (-1, n + 2), 8),
+    ]))
+    return t
+
+
+def construir_pdf_ciclico(estado, solo_revisadas=False):
+    turno = estado["turno"]
+    sitios = sorted(estado["sitios"], key=lambda s: ORDEN_OFICIAL.get(s["sucursal"], 99))
     fecha_txt = _fecha_larga(estado["fecha"])
     buffer = BytesIO()
     doc = SimpleDocTemplate(
-        buffer, pagesize=letter, leftMargin=0.6 * inch, rightMargin=0.6 * inch,
-        topMargin=0.6 * inch, bottomMargin=0.7 * inch,
-        title=f"Monitoreo Cíclico INJUL {fecha_txt}", author="INJUL",
+        buffer, pagesize=A4, leftMargin=MARGEN_X, rightMargin=MARGEN_X,
+        topMargin=60, bottomMargin=42,
+        title=f"INJUL - Plan de Monitoreo Tiempo Real Cíclico Diario {fecha_txt}", author="INJUL",
     )
-    ancho = letter[0] - 1.2 * inch
-    est = {
-        "titulo": ParagraphStyle("t", fontName="Helvetica-Bold", fontSize=15, textColor=colors.white, alignment=1, leading=19),
-        "sub": ParagraphStyle("s", fontName="Helvetica", fontSize=9, textColor=colors.white, alignment=1),
-        "h": ParagraphStyle("h", fontName="Helvetica-Bold", fontSize=11, textColor=AZUL, spaceBefore=10, spaceAfter=4),
-        "n": ParagraphStyle("n", fontName="Helvetica", fontSize=8.5, leading=11),
-        "nb": ParagraphStyle("nb", fontName="Helvetica-Bold", fontSize=8.5, leading=11),
-        "cab": ParagraphStyle("c", fontName="Helvetica-Bold", fontSize=8, textColor=colors.white),
-    }
-
     story = []
-    banner = Table(
-        [[Paragraph("CENTRO DE MONITOREO GENERAL MARMOTECH", est["titulo"])],
-         [Paragraph("INJUL · Plan de Monitoreo Tiempo Real Cíclico Diario", est["sub"])]],
-        colWidths=[ancho],
-    )
+
+    # 1) Banner
+    banner = Table([[Paragraph("CENTRO DE MONITOREO GENERAL MARMOTECH", E_TITULO)],
+                    [Paragraph("INJUL · Plan de Monitoreo Tiempo Real Cíclico Diario", E_SUB)]], colWidths=[ANCHO])
     banner.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), AZUL), ("TOPPADDING", (0, 0), (-1, -1), 6),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("BACKGROUND", (0, 0), (-1, -1), NAVY), ("ROUNDEDCORNERS", [4, 4, 4, 4]),
+        ("TOPPADDING", (0, 0), (-1, 0), 14), ("BOTTOMPADDING", (0, 0), (-1, 0), 1),
+        ("TOPPADDING", (0, 1), (-1, 1), 1), ("BOTTOMPADDING", (0, 1), (-1, 1), 13),
     ]))
-    story += [banner, Spacer(1, 8)]
+    story += [banner, Spacer(1, 12)]
 
-    datos = [
-        ["FECHA", fecha_txt, "DÍA DE ROTACIÓN", turno["dia_rotacion"] or "—"],
-        ["DESDE", turno["desde"] or "—", "HASTA", turno["hasta"] or "—"],
-        ["UBICACIÓN / SISTEMA", turno["ubicacion_sistema"] or "—", "RESPONSABLE DE TURNO", turno["responsable"] or "—"],
-    ]
-    filas = [[Paragraph(_txt(c), est["nb"] if i % 2 == 0 else est["n"]) for i, c in enumerate(f)] for f in datos]
-    t_datos = Table(filas, colWidths=[1.25 * inch, ancho / 2 - 1.25 * inch, 1.45 * inch, ancho / 2 - 1.45 * inch])
-    t_datos.setStyle(TableStyle([
-        ("GRID", (0, 0), (-1, -1), 0.4, colors.lightgrey), ("BACKGROUND", (0, 0), (0, -1), GRIS),
-        ("BACKGROUND", (2, 0), (2, -1), GRIS), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    # 2) Datos del turno
+    mitad = ANCHO / 2
+    fila1 = Table([[_campo("FECHA", fecha_txt, mitad - 10), _campo("DÍA DE ROTACIÓN", turno["dia_rotacion"], mitad - 10)],
+                   [_campo("DESDE", _hora12(turno["desde"]), mitad - 10), _campo("HASTA", _hora12(turno["hasta"]), mitad - 10)]],
+                  colWidths=[mitad, mitad])
+    fila1.setStyle(TableStyle([
+        ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
     ]))
-    story.append(t_datos)
+    story += [fila1, _campo("UBICACIÓN / SISTEMA", turno["ubicacion_sistema"], ANCHO), Spacer(1, 4),
+              _campo("RESPONSABLE DE TURNO", turno["responsable"], ANCHO), Spacer(1, 10)]
 
-    # Resumen
-    story.append(Paragraph("RESUMEN INFORMATIVO DEL PROCESO", est["h"]))
-    resumen = [[Paragraph(x, est["cab"]) for x in
-                ["SEDE / SUCURSAL", "TOTAL CÁMARAS", "REVISADAS", "INICIO", "FIN", "NOVEDAD"]]]
+    # 3) Resumen informativo
+    barra = Table([[Paragraph("RESUMEN INFORMATIVO DEL PROCESO", E_BARRA)]], colWidths=[ANCHO - 4])
+    barra.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), NAVY), ("ROUNDEDCORNERS", [4, 4, 0, 0]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8), ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story.append(barra)
+    c1, c2 = ANCHO * 0.40, ANCHO * 0.27
+    c3 = ANCHO - c1 - c2
+    filas = [[Paragraph("SEDE PRINCIPAL/SUCURSALES", E_TH), Paragraph("TOTAL CÁMARAS", E_TH),
+              Paragraph("CÁMARAS MONITOREADAS HOY", E_TH)]]
     for s in sitios:
-        completo = s["revisadas"] == s["total"]
-        resumen.append([
-            Paragraph(_txt(s["sucursal"]), est["n"]), str(s["total"]),
-            f'{s["revisadas"]} / {s["total"]}' + (" (completo)" if completo else ""),
-            s["hora_inicio"] or "—", s["hora_fin"] or "—", "Sí" if s["novedades"] else "s/n",
-        ])
-    tot = sum(s["total"] for s in sitios)
-    rev = sum(s["revisadas"] for s in sitios)
-    resumen.append([Paragraph("TOTAL", est["nb"]), str(tot), f"{rev} / {tot}", "", "", ""])
-    t_res = Table(resumen, colWidths=[2.3 * inch, 0.9 * inch, 1.5 * inch, 0.7 * inch, 0.7 * inch, ancho - 6.1 * inch], repeatRows=1)
-    estilo = [
-        ("BACKGROUND", (0, 0), (-1, 0), AZUL), ("GRID", (0, 0), (-1, -1), 0.4, colors.lightgrey),
-        ("FONTNAME", (0, 1), (-1, -1), "Helvetica"), ("FONTSIZE", (0, 1), (-1, -1), 8.5),
-        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"), ("BACKGROUND", (0, -1), (-1, -1), GRIS),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-    ]
-    for i, s in enumerate(sitios, start=1):
-        if s["revisadas"] == s["total"]:
-            estilo.append(("BACKGROUND", (0, i), (-1, i), VERDE_CLARO))
-    t_res.setStyle(TableStyle(estilo))
-    story.append(t_res)
+        filas.append([Paragraph(_txt(_nombre_oficial(s["sucursal"])), E_FILA), Paragraph(str(s["total"]), E_FILA),
+                      EstadoMonitoreo(s["revisadas"] == s["total"], s["revisadas"], s["total"], bool(s["novedades"]))])
+    resumen = Table(filas, colWidths=[c1, c2, c3], repeatRows=1)
+    resumen.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), NAVY),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, FILA_ALT]),
+        ("GRID", (0, 1), (-1, -1), 0.5, colors.HexColor("#E3E3E3")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("ALIGN", (2, 1), (2, -1), "LEFT"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 9), ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LEFTPADDING", (2, 1), (2, -1), 0),
+    ]))
+    story += [resumen, Spacer(1, 14)]
 
-    # Detalle por sucursal
-    story.append(Paragraph(f'DETALLE DEL BLOQUE Y NOVEDADES POR SITIO — {_txt((turno["dia_rotacion"] or "").upper())}', est["h"]))
+    # 4) Un bloque por sede
     for s in sitios:
-        cab = Table(
-            [[Paragraph(_txt(s["sucursal"]), est["cab"]),
-              Paragraph(f'Inicio: {s["hora_inicio"] or "—"} · Fin: {s["hora_fin"] or "—"} · Revisadas: {s["revisadas"]}/{s["total"]}', est["cab"])]],
-            colWidths=[ancho * 0.45, ancho * 0.55],
-        )
-        cab.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), AZUL), ("TOPPADDING", (0, 0), (-1, -1), 4),
-                                 ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]))
-        filas = [["#", "Cámara (EZStation)", "Revisada", "Inicio", "Fin"]]
-        for c in s["camaras"]:
-            filas.append([str(c["idx"] + 1), Paragraph(_txt(c["nombre"]), est["n"]),
-                          "Sí" if c["revisada"] else "—", c["hora_inicio"] or "", c["hora_fin"] or ""])
-        t_cam = Table(filas, colWidths=[0.4 * inch, ancho - 2.8 * inch, 0.8 * inch, 0.8 * inch, 0.8 * inch], repeatRows=1)
-        e = [
-            ("BACKGROUND", (0, 0), (-1, 0), GRIS), ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTNAME", (0, 1), (-1, -1), "Helvetica"), ("FONTSIZE", (0, 0), (-1, -1), 8),
-            ("GRID", (0, 0), (-1, -1), 0.3, colors.lightgrey), ("ALIGN", (2, 0), (-1, -1), "CENTER"),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("TOPPADDING", (0, 0), (-1, -1), 2),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-        ]
-        for i, c in enumerate(s["camaras"], start=1):
-            if c["revisada"]:
-                e.append(("BACKGROUND", (0, i), (-1, i), VERDE_CLARO))
-        t_cam.setStyle(TableStyle(e))
-        nov = Table(
-            [[Paragraph("<b>Novedades y acciones tomadas:</b> " + (_txt(s["novedades"]).replace("\n", "<br/>") or "s/n"), est["n"])]],
-            colWidths=[ancho],
-        )
-        nov.setStyle(TableStyle([("BOX", (0, 0), (-1, -1), 0.4, colors.lightgrey), ("BACKGROUND", (0, 0), (-1, -1), GRIS)]))
-        # La cabecera y la primera parte viajan juntas; la lista larga puede partirse de página.
-        story += [Spacer(1, 6), KeepTogether([cab, Spacer(1, 2)]), t_cam, Spacer(1, 3), nov]
+        story += [_bloque_sitio(s, solo_revisadas), Spacer(1, 10)]
 
-    # Informe global y firma
-    informe = [
-        Paragraph("INFORME DE NOVEDADES DEL TURNO", est["h"]),
-        Paragraph(f'<b>Fecha:</b> {fecha_txt} &nbsp;&nbsp; <b>Área:</b> {_txt(turno["area"] or "—")}', est["n"]),
+    # 5) Informe de novedades del turno + firma + pie
+    area = turno["area"] or ""
+    lineas = [f"Fecha: {fecha_txt}", f'Hora del informe: {estado.get("hora_informe", "")}',
+              f"Área: {area}", "Reporte de Monitoreo"]
+    texto = "".join(f"{_txt(x)}<br/>" for x in lineas)
+    cuerpo = (turno["informe_novedades"] or "Sin observaciones generales registradas.").strip()
+    texto += "<br/>".join(_txt(x) for x in cuerpo.splitlines())
+    nombre_resp = _txt(turno["responsable"])
+    informe = Table([
+        [Paragraph(f"INFORME DE NOVEDADES{_turno_nombre(turno['desde'])}", E_INF_T)],
+        [Paragraph(texto, E_INF)],
+        [_caja_redonda(Paragraph(f"<b>{nombre_resp}</b>" if nombre_resp else "&nbsp;", _ps("r", fontName="Helvetica-Bold", fontSize=7.5)),
+                       ANCHO - 34, 26, CAJA, colors.HexColor("#E3E3E3"), 28)],
+    ], colWidths=[ANCHO])
+    informe.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.8, BORDE), ("ROUNDEDCORNERS", [4, 4, 4, 4]),
+        ("LINEBEFORE", (0, 0), (0, -1), 4, NAVY), ("LINEBELOW", (0, 0), (0, 0), 0.6, BORDE),
+        ("LEFTPADDING", (0, 0), (-1, -1), 24), ("RIGHTPADDING", (0, 0), (-1, -1), 18),
+        ("TOPPADDING", (0, 0), (-1, 0), 9), ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
+        ("TOPPADDING", (0, 1), (-1, 1), 8), ("BOTTOMPADDING", (0, 1), (-1, 1), 12),
+        ("TOPPADDING", (0, 2), (-1, 2), 4), ("BOTTOMPADDING", (0, 2), (-1, 2), 10),
+    ]))
+    firma = [
+        Paragraph("FIRMA DEL RESPONSABLE", _ps("f", fontName="Helvetica-Bold", fontSize=8, textColor=GRIS_ETQ)),
         Spacer(1, 4),
-        Paragraph(_txt(turno["informe_novedades"] or "Sin observaciones generales registradas.").replace("\n", "<br/>"), est["n"]),
-        Spacer(1, 18),
-        Paragraph("FIRMA DEL RESPONSABLE", est["nb"]),
-        Spacer(1, 14),
-        Paragraph(_txt(turno["responsable"] or "______________________"), est["n"]),
+        _caja_redonda(Paragraph(f"<b>{nombre_resp}</b>" if nombre_resp else "&nbsp;", _ps("fr", fontName="Helvetica-Bold", fontSize=7.5)),
+                      ANCHO, 28, colors.white, BORDE, 40),
+        Spacer(1, 6),
+        Paragraph("Los datos se guardan en el sistema por fecha.", E_PIE),
     ]
-    story.append(KeepTogether(informe))
+    story.append(KeepTogether([informe, Spacer(1, 22)] + firma))
 
-    def pie(canvas, doc_):
-        canvas.saveState()
-        canvas.setFont("Helvetica", 7.5)
-        canvas.setFillColor(colors.grey)
-        canvas.drawString(0.6 * inch, 0.4 * inch, f"INJUL · Monitoreo Cíclico · {fecha_txt}")
-        canvas.drawRightString(letter[0] - 0.6 * inch, 0.4 * inch, f"Página {doc_.page}")
-        canvas.restoreState()
-
-    doc.build(story, onFirstPage=pie, onLaterPages=pie)
+    doc.build(story)
     buffer.seek(0)
     return buffer
 
@@ -762,7 +997,11 @@ def _respuesta_descarga(constructor, extension, mimetype):
 
 @bp.route("/descargar-pdf")
 def descargar_pdf():
-    return _respuesta_descarga(construir_pdf_ciclico, "pdf", "application/pdf")
+    # ?solo=1 -> sólo las cámaras marcadas como revisadas (por defecto, el catálogo completo)
+    solo = request.args.get("solo") == "1"
+    return _respuesta_descarga(
+        lambda estado: construir_pdf_ciclico(estado, solo_revisadas=solo), "pdf", "application/pdf"
+    )
 
 
 @bp.route("/descargar-excel")
@@ -854,7 +1093,7 @@ PAGINA = """<!DOCTYPE html>
     <a class="btn gris" href="/">← Consolidado CCTV</a>
     <a class="btn gris" href="/ciclico/historial">Historial de turnos</a>
     <a class="btn gris" id="lnk-aud" href="#">Auditoría del día</a>
-    <a class="btn rojo" id="dl-pdf-top" href="#">⬇ PDF</a>
+    <a class="btn rojo" id="dl-pdf-top" href="#">⬇ PDF oficial</a>
     <a class="btn verde" id="dl-xlsx-top" href="#">⬇ Excel</a>
   </div>
 
@@ -892,11 +1131,14 @@ PAGINA = """<!DOCTYPE html>
     <p style="font-size:12px;color:#777;margin:8px 0 0">La firma toma el nombre del responsable de turno.</p>
   </div>
   <div class="card"><h2>Descargar reporte del turno</h2>
-    <p style="font-size:12px;color:#777;margin:0 0 10px">Incluye datos del turno, resumen, checklist con horas, novedades por sucursal e informe global de la fecha seleccionada.</p>
+    <p style="font-size:12px;color:#777;margin:0 0 10px">El PDF sigue el formato oficial INJUL: datos del turno, resumen, bloque por sucursal con horas de inicio y fin, novedades, informe de turno y firma, de la fecha seleccionada.</p>
     <div class="descargas">
-      <a class="btn rojo" id="dl-pdf" href="#">⬇ Descargar PDF</a>
+      <a class="btn rojo" id="dl-pdf" href="#">⬇ Descargar PDF oficial</a>
       <a class="btn verde" id="dl-xlsx" href="#">⬇ Descargar Excel</a>
     </div>
+    <label style="text-transform:none;font-size:13px;font-weight:normal;margin:10px 0 0">
+      <input type="checkbox" id="dl-solo"> Incluir en el PDF sólo las cámaras revisadas
+    </label>
   </div>
   <div id="estado" class="estado" style="display:none"></div>
 </div>
@@ -1033,10 +1275,14 @@ function pintarChecklist(){
 
 function enlazarDescargas(){
   [["dl-pdf","descargar-pdf"],["dl-xlsx","descargar-excel"],["dl-pdf-top","descargar-pdf"],["dl-xlsx-top","descargar-excel"]].forEach(function(par){
-    var a = $(par[0]), url = "/ciclico/" + par[1] + "?fecha=" + S.fecha;
-    a.href = url;
+    var a = $(par[0]), base = "/ciclico/" + par[1] + "?fecha=" + S.fecha;
+    var armar = function(){
+      return base + ((par[1] === "descargar-pdf" && $("dl-solo").checked) ? "&solo=1" : "");
+    };
+    a.href = armar();
     a.onclick = function(ev){
       ev.preventDefault();
+      var url = armar();
       if (a.classList.contains("cargando")) return;
       a.classList.add("cargando");
       var texto = a.textContent; a.textContent = "Preparando…";
