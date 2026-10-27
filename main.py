@@ -7,8 +7,9 @@ Cada cambio de estado u observación se guarda al instante y queda en el histori
 import json
 import logging
 import os
+import re
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime
 from io import BytesIO
 from xml.sax.saxutils import escape
 
@@ -205,6 +206,43 @@ CATALOGO_CICLICO = {
         "Frente hacia lado norte", "Oficina Gabinete data",
     ],
 }
+
+# --- ROTACIÓN DIARIA DEL MONITOREO CÍCLICO ---
+# CATALOGO_CICLICO es el bloque OFICIAL de referencia (PDF del 24/10/2026): define
+# cuántos cuadros lleva cada sede (10 ó 5) y es el punto de partida de la rotación.
+# Cada día el bloque avanza por el "pool" de la sede (bloque oficial + resto del
+# inventario) y el operador puede cambiar cualquier cuadro desde la pantalla.
+ANCLA_ROTACION = date(2026, 10, 24)  # día en que el bloque es exactamente el oficial
+
+# Sede cíclica -> sede del inventario completo (CATALOGO_CAMARAS) de donde salen las rotantes.
+INVENTARIO_DE = {
+    "Sucursal San Cristóbal": "Sucursal San Cristóbal",
+    "Marmotech DCM": "Marmotech DCM",
+    "Marmotech Santiago 1": "Marmotech Santiago 1",
+    "Marmotech Santiago 2": "Marmotech Santiago 2",
+    "Marmotech Blue Mall": "Marmotech Blue Mall",
+    "Marmotech Outlet RP": "Marmotech Outlet RP",
+    "Marmotech Punta Cana": "Marmotech Punta Cana",
+    "Caribbean Agregados": "Caribbean Agregados",
+}
+
+
+def _construir_pool(clave):
+    """Bloque oficial primero (orden oficial) + cámaras del inventario que no se repiten."""
+    base = list(CATALOGO_CICLICO[clave])
+    vistos = {n.lower() for n in base}
+    nums = {m for n in base for m in re.findall(r"ip camera\s*0*(\d+)", n.lower())}
+    extra = []
+    for n in CATALOGO_CAMARAS.get(INVENTARIO_DE.get(clave, ""), []):
+        ip = re.findall(r"ip camera\s*0*(\d+)$", n.lower())
+        if n.lower() in vistos or (ip and ip[0] in nums):
+            continue
+        vistos.add(n.lower())
+        extra.append(n)
+    return base + extra
+
+
+POOL_CICLICO = {clave: _construir_pool(clave) for clave in CATALOGO_CICLICO}
 
 ESTADOS = [
     ("Operativa", "Operativa (Sí)"),
@@ -1292,6 +1330,8 @@ import ciclico  # noqa: E402
 ciclico.registrar(
     app,
     catalogo=CATALOGO_CICLICO,
+    pool=POOL_CICLICO,
+    ancla=ANCLA_ROTACION,
     db_cursor=db_cursor,
     ahora=ahora,
     local_txt=local_txt,
