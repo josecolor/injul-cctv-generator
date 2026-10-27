@@ -246,3 +246,169 @@ def inicializar_base_de_datos():
     try:
         with db_cursor() as cur:
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS reportes_tickets (
+                    id SERIAL PRIMARY KEY,
+                    fecha DATE NOT NULL,
+                    ticket VARCHAR(50) NOT NULL,
+                    sucursal_area VARCHAR(150) NOT NULL,
+                    estado VARCHAR(50) NOT NULL,
+                    dias_abiertos INT DEFAULT 0,
+                    detalle TEXT,
+                    creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS estado_camaras_actual (
+                    sucursal VARCHAR(100) NOT NULL,
+                    camara VARCHAR(150) NOT NULL,
+                    estado VARCHAR(50) NOT NULL,
+                    en_vivo VARCHAR(20) NOT NULL DEFAULT '',
+                    grabacion VARCHAR(30) NOT NULL DEFAULT 'Normal',
+                    observacion TEXT NOT NULL DEFAULT '',
+                    actualizado_en TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (sucursal, camara)
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS historial_cctv (
+                    id BIGSERIAL PRIMARY KEY,
+                    cambiado_en TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    sucursal VARCHAR(100) NOT NULL,
+                    camara VARCHAR(150) NOT NULL,
+                    estado_anterior VARCHAR(50),
+                    estado_nuevo VARCHAR(50) NOT NULL,
+                    observacion_anterior TEXT,
+                    observacion_nueva TEXT,
+                    origen VARCHAR(60)
+                );
+            """)
+            cur.execute("ALTER TABLE estado_camaras_actual ADD COLUMN IF NOT EXISTS en_vivo VARCHAR(20) NOT NULL DEFAULT '';")
+            cur.execute("ALTER TABLE estado_camaras_actual ADD COLUMN IF NOT EXISTS grabacion VARCHAR(30) NOT NULL DEFAULT 'Normal';")
+    except Exception:
+        logger.exception("Error inicializando BD")
+
+def cargar_datos():
+    datos = {"detalles": {}, "tickets": [], "actualizado": ""}
+    if not DATABASE_URL:
+        return datos
+    try:
+        with db_cursor() as cur:
+            cur.execute("SELECT sucursal, camara, estado, en_vivo, grabacion, observacion, actualizado_en FROM estado_camaras_actual")
+            ultima = None
+            for suc, cam, est, env, grb, obs, momento in cur.fetchall():
+                datos["detalles"].setdefault(suc, {})[cam] = {
+                    "estado": est,
+                    "en_vivo": env or "",
+                    "grabacion": grb or "Normal",
+                    "observacion": obs or "",
+                }
+                if ultima is None or momento > ultima:
+                    ultima = momento
+            datos["actualizado"] = local_txt(ultima)
+            cur.execute("SELECT ticket, fecha, sucursal_area, estado, dias_abiertos, detalle FROM reportes_tickets ORDER BY id DESC")
+            datos["tickets"] = [[str(t[0]), str(t[1]), str(t[2]), str(t[3]), str(t[4]), str(t[5] or "")] for t in cur.fetchall()]
+    except Exception:
+        logger.exception("Error leyendo datos")
+    return datos
+
+def cargar_historial(limite=200, sucursal=None):
+    if not DATABASE_URL:
+        return []
+    consulta = "SELECT cambiado_en, sucursal, camara, estado_anterior, estado_nuevo, observacion_anterior, observacion_nueva, origen FROM historial_cctv"
+    params = []
+    if sucursal:
+        consulta += " WHERE sucursal = %s"
+        params.append(sucursal)
+    consulta += " ORDER BY id DESC LIMIT %s"
+    params.append(limite)
+    try:
+        with db_cursor() as cur:
+            cur.execute(consulta, params)
+            return [[local_txt(f[0]), f[1], f[2], f[3] or "(sin registro)", f[4], f[5] or "", f[6] or "", f[7] or ""] for f in cur.fetchall()]
+    except Exception:
+        return []
+
+def estado_de(detalles, sucursal, camara):
+    info = detalles.get(sucursal, {}).get(camara)
+    return info["estado"] if info else "Por verificar"
+
+def resumen_sucursal(detalles, sucursal):
+    camaras = CATALOGO_CAMARAS[sucursal]
+    op = nv = pv = 0
+    for cam in camaras:
+        est = estado_de(detalles, sucursal, cam)
+        if est == "Operativa": op += 1
+        elif est == "No visible": nv += 1
+        else: pv += 1
+    total = len(camaras)
+    disp = (op / total * 100) if total else 0
+    return total, op, nv, pv, disp
+
+def resumen_total(detalles):
+    total = op = nv = pv = 0
+    for suc in CATALOGO_CAMARAS:
+        t, o, n, p, _ = resumen_sucursal(detalles, suc)
+        total, op, nv, pv = total + t, op + o, nv + n, pv + p
+    disp = (op / total * 100) if total else 0
+    return total, op, nv, pv, disp
+
+def resumen_dict(detalles):
+    total, op, nv, pv, disp = resumen_total(detalles)
+    return {"total": total, "operativas": op, "no_visibles": nv, "por_verificar": pv, "disponibilidad": disp}
+
+@app.route("/health")
+def health():
+    return "ok", 200
+
+@app.route("/")
+def index():
+    tipo, mensaje = MENSAJES.get(request.args.get("msg"), (None, None))
+    try: seleccion = int(request.args.get("s", 0))
+    except ValueError: seleccion = 0
+    datos = cargar_datos()
+    return render_template(
+        "index.html",
+        catalogo=CATALOGO_CAMARAS,
+        detalles=datos["detalles"],
+        resumen=resumen_dict(datos["detalles"]),
+        estados=ESTADOS,
+        clases=CLASES_ESTADO,
+        mensaje=mensaje,
+        tipo=tipo,
+        seleccion=seleccion,
+    )
+
+@app.route("/api/camara", methods=["POST"])
+def api_camara():
+    datos_in = request.get_json(silent=True) or {}
+    sucursal = datos_in.get("sucursal")
+    estado = datos_in.get("estado")
+    en_vivo = str(datos_in.get("en_vivo") or "")
+    grabacion = str(datos_in.get("grabacion") or "Normal")
+    observacion = str(datos_in.get("observacion") or "").strip()[:500]
+    idx = datos_in.get("idx")
+
+    if sucursal not in CATALOGO_CAMARAS:
+        return jsonify(ok=False, error="Sucursal no válida"), 400
+    if not isinstance(idx, int) or isinstance(idx, bool) or not 0 <= idx < len(CATALOGO_CAMARAS[sucursal]):
+        return jsonify(ok=False, error="Cámara no válida"), 400
+    if estado not in ESTADOS_VALIDOS:
+        return jsonify(ok=False, error="Estado no válido"), 400
+    if not DATABASE_URL:
+        return jsonify(ok=False, error="BD no configurada"), 503
+
+    camara = CATALOGO_CAMARAS[sucursal][idx]
+    try:
+        with db_cursor() as cur:
+            cur.execute("SELECT estado, observacion FROM estado_camaras_actual WHERE sucursal = %s AND camara = %s FOR UPDATE", (sucursal, camara))
+            previo = cur.fetchone()
+            est_ant = previo[0] if previo else None
+            obs_ant = (previo[1] or "") if previo else None
+            cambiado = previo is None or est_ant != estado or obs_ant != observacion
+            
+            cur.execute("""
+                INSERT INTO estado_camaras_actual (sucursal, camara, estado, en_vivo, grabacion, observacion, actualizado_en)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (sucursal, camara) DO UPDATE
+                SET estado = EXCLUDED.estado, en_vivo = EXCLUDED.en_vivo, grabacion = EXCLUDED.grabacion,
+                    observacion = EXCLUDED.observ
